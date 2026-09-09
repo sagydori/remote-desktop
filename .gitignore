@@ -4,3 +4,11 @@ config.py
 # Python cruft
 __pycache__/
 *.pyc
+
+# Per-PC settings (created by the Settings window)
+settings.json
+
+# Build output from BUILD.bat (never publish the big .exe to the repo)
+build/
+dist/
+*.spec

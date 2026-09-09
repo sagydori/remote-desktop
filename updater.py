@@ -21,7 +21,7 @@ BRANCH = "main"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VERSION_FILE = os.path.join(HERE, "VERSION")
-PRESERVE = {"config.py"}         # local settings are never overwritten
+PRESERVE = {"config.py", "settings.json"}   # local settings are never overwritten
 
 
 def _configured():
@@ -61,6 +61,8 @@ def _download_and_apply(timeout=45):
 
 def check_and_update():
     """Return True if an update was applied and the app was relaunched."""
+    if getattr(sys, "frozen", False):
+        return False                # packaged .exe: source-swap update doesn't apply
     if not _configured():
         return False
     try:

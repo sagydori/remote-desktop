@@ -15,6 +15,7 @@ import concurrent.futures
 import json
 import os
 import queue
+import sys
 import threading
 import time
 from collections import deque
@@ -28,6 +29,17 @@ from pynput.keyboard import Controller as KeyboardController, Key
 from pynput.mouse import Button, Controller as MouseController
 import websockets
 
+# When packaged as an .exe (PyInstaller), the app's own files — config.py,
+# settings.json, icon.ico, VERSION — live next to the executable, not inside
+# the temporary unpack dir. Resolve paths against the exe in that case.
+if getattr(sys, "frozen", False):
+    HERE = os.path.dirname(sys.executable)
+else:
+    HERE = os.path.dirname(os.path.abspath(__file__))
+ICON = os.path.join(HERE, "icon.ico")
+
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)                # so `import config` finds config.py beside the exe
 try:
     import config
 except Exception:
@@ -37,17 +49,44 @@ PEER = getattr(config, "PEER", "") or getattr(config, "HOST", "")
 PORT = getattr(config, "PORT", 8765)
 SECRET = getattr(config, "SECRET", "")
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ICON = os.path.join(HERE, "icon.ico")
+# ---- Windows raw relative mouse motion (for in-game camera / mouse-look) ----
+# Games (Minecraft, FPS titles) grab the pointer and read RAW motion deltas.
+# Setting an absolute cursor position doesn't turn the camera; injecting a
+# relative MOUSEEVENTF_MOVE via SendInput does, for both "Raw Input" on and off.
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    _MOUSEEVENTF_MOVE = 0x0001
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long),
+                    ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+    class _INPUTUNION(ctypes.Union):
+        _fields_ = [("mi", _MOUSEINPUT)]
+
+    class _INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
+
+    def _move_relative(dx, dy):
+        extra = ctypes.c_ulong(0)
+        mi = _MOUSEINPUT(int(dx), int(dy), 0, _MOUSEEVENTF_MOVE, 0, ctypes.pointer(extra))
+        inp = _INPUT(0, _INPUTUNION(mi))
+        ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+else:
+    def _move_relative(dx, dy):
+        pass  # patched to pynput's relative move per-controller on non-Windows
 
 # capture / quality  —  full native resolution, sharp; ease compression only under load
-MIN_QUALITY, MIN_SCALE = 60, 1.0     # never downscale (scale pinned at 1.0); quality floor 60
+MIN_QUALITY, MIN_SCALE = 72, 1.0     # never downscale (scale pinned at 1.0); quality floor 72 (stay sharp)
 SCALE = 1.0
 DIFF_THRESHOLD = 1.2
 KEYFRAME_EVERY = 2.0
 USE_BETTERCAM = True
-DEFAULT_QUALITY = 85
-DEFAULT_FPS = 30
+DEFAULT_QUALITY = 92                  # high quality; edges/text stay crisp
+DEFAULT_FPS = 60                      # smooth 60 fps
 
 # palette
 BG = "#12141a"
@@ -70,6 +109,38 @@ _SPECIAL = {
 _MOUSE = {1: "left", 2: "middle", 3: "right"}
 
 
+# ---- user-customizable settings (persisted; survives auto-update) ----------
+SETTINGS_FILE = os.path.join(HERE, "settings.json")
+DEFAULT_SETTINGS = {
+    "appearance": "Dark",       # Dark | Light | System
+    "theme": "blue",            # blue | green | dark-blue
+    "fps": DEFAULT_FPS,         # streaming frame rate when this PC is shared
+    "quality": DEFAULT_QUALITY, # streaming JPEG quality when this PC is shared
+    "sensitivity": 1.0,         # mouse-look turn speed multiplier
+    "ui_scale": 1.0,            # overall GUI size (widget scaling)
+}
+
+
+def load_settings():
+    s = dict(DEFAULT_SETTINGS)
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            s.update({k: data[k] for k in DEFAULT_SETTINGS if k in data})
+    except Exception:
+        pass
+    return s
+
+
+def save_settings(s):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(s, f, indent=2)
+    except Exception:
+        pass
+
+
 # ===========================================================================
 #  SHARED: input replay, adaptive encoder, capture
 # ===========================================================================
@@ -89,15 +160,25 @@ class InputController:
         t = e.get("type")
         if t == "move":
             self.mouse.position = self._abs(e["x"], e["y"])
+        elif t == "rmove":
+            # relative motion for in-game camera / mouse-look (no absolute repositioning)
+            dx, dy = e.get("dx", 0), e.get("dy", 0)
+            if os.name == "nt":
+                _move_relative(dx, dy)
+            else:
+                self.mouse.move(int(dx), int(dy))
         elif t == "click":
-            self.mouse.position = self._abs(e["x"], e["y"])
+            # In game mode the pointer is locked; don't reposition it (would jerk the camera)
+            if not e.get("game"):
+                self.mouse.position = self._abs(e["x"], e["y"])
             b = self._BUTTONS.get(e.get("button"), Button.left)
             if e.get("pressed"):
                 self.mouse.press(b); self._btns.add(b)
             else:
                 self.mouse.release(b); self._btns.discard(b)
         elif t == "scroll":
-            self.mouse.position = self._abs(e["x"], e["y"])
+            if not e.get("game"):
+                self.mouse.position = self._abs(e["x"], e["y"])
             self.mouse.scroll(e.get("dx", 0), e.get("dy", 0))
         elif t == "key":
             key = getattr(Key, e["key"], None) if e.get("special") else e.get("key")
@@ -187,7 +268,12 @@ class ScreenGrabber:
             self._prev = sig
         if scale != 1.0:
             bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+        params = [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+        # 4:4:4 chroma: keep colored edges and text crisp instead of smeared (default is 4:2:0)
+        if hasattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR"):
+            params += [int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR),
+                       int(getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x111111))]
+        ok, buf = cv2.imencode(".jpg", bgr, params)
         return buf.tobytes() if ok else None
 
     def close(self):
@@ -454,9 +540,17 @@ class ClientBackend:
 class RemoteDesktopApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
-        self.title("Remote Desktop")
+        self.settings = load_settings()
+        ctk.set_appearance_mode(self.settings.get("appearance", "Dark"))
+        try:
+            ctk.set_default_color_theme(self.settings.get("theme", "blue"))
+        except Exception:
+            ctk.set_default_color_theme("blue")
+        try:
+            ctk.set_widget_scaling(float(self.settings.get("ui_scale", 1.0)))
+        except Exception:
+            pass
+        self.title("doris pccontrol")
         self.geometry("1280x820")
         self.minsize(820, 560)
         self.configure(fg_color=BG)
@@ -479,10 +573,12 @@ class RemoteDesktopApp(ctk.CTk):
         self.client_paired = False
         self.paused = False
         self.fullscreen = False
+        self.game_mode = False
         self.video_rect = (0, 0, 1, 1)
         self._last_counter = -1
         self._photo = None
         self._pending_move = None
+        self._pending_rmove = [0, 0]
         self._fps = deque(maxlen=60)
         self._bytes = deque(maxlen=120)
         self.rtt = None
@@ -511,9 +607,11 @@ class RemoteDesktopApp(ctk.CTk):
         header.pack(fill="x", padx=28, pady=(20, 0))
         if self._icon_img is not None:
             ctk.CTkLabel(header, image=self._icon_img, text="").pack(side="left")
-        ctk.CTkLabel(header, text="  Remote Desktop",
+        ctk.CTkLabel(header, text="  doris pccontrol",
                      font=ctk.CTkFont(size=20, weight="bold")).pack(side="left")
-        ctk.CTkLabel(header, text=f"This PC:  {NAME}", text_color=MUTED,
+        ctk.CTkButton(header, text="⚙  Settings", width=110, fg_color="#374151",
+                      hover_color="#2c333f", command=self._open_settings).pack(side="right")
+        ctk.CTkLabel(header, text=f"This PC:  {NAME}    ", text_color=MUTED,
                      font=ctk.CTkFont(size=13)).pack(side="right")
 
         card = ctk.CTkFrame(self.home, corner_radius=22, fg_color=CARD)
@@ -569,7 +667,9 @@ class RemoteDesktopApp(ctk.CTk):
         self._stop_share() if self.host is not None else self._start_share()
 
     def _start_share(self):
-        self.host = HostBackend(self.host_events)
+        self.host = HostBackend(self.host_events,
+                                quality=int(self.settings.get("quality", DEFAULT_QUALITY)),
+                                fps=int(self.settings.get("fps", DEFAULT_FPS)))
         self.host.start()
         self.sharing = True
         self.share_btn.configure(text="🔒   Stop allowing control", fg_color=RED,
@@ -584,6 +684,127 @@ class RemoteDesktopApp(ctk.CTk):
                                  fg_color="#374151", hover_color="#2c333f")
         self._apply_host_state("off")
 
+    # ---- settings window -------------------------------------------------
+    def _open_settings(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Settings")
+        win.geometry("460x620")
+        win.configure(fg_color=BG)
+        win.transient(self)
+        win.after(250, lambda: (win.lift(), win.focus_force()))
+        try:
+            win.iconbitmap(ICON)
+        except Exception:
+            pass
+
+        wrap = ctk.CTkScrollableFrame(win, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=22, pady=18)
+
+        ctk.CTkLabel(wrap, text="Settings", font=ctk.CTkFont(size=20, weight="bold")).pack(
+            anchor="w", pady=(0, 4))
+        ctk.CTkLabel(wrap, text="Personalize the app and how it streams.",
+                     text_color=MUTED, font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(0, 14))
+
+        def section(title):
+            ctk.CTkLabel(wrap, text=title.upper(), text_color="#7c8698",
+                         font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", pady=(16, 4))
+
+        # --- Appearance ---
+        section("Appearance")
+        appear_var = ctk.StringVar(value=self.settings.get("appearance", "Dark"))
+        ctk.CTkLabel(wrap, text="Theme mode", font=ctk.CTkFont(size=13)).pack(anchor="w")
+        ctk.CTkOptionMenu(wrap, values=["Dark", "Light", "System"], variable=appear_var,
+                          command=lambda v: ctk.set_appearance_mode(v)).pack(anchor="w", pady=(2, 8))
+
+        color_var = ctk.StringVar(value=self.settings.get("theme", "blue"))
+        ctk.CTkLabel(wrap, text="Accent color  (applies after restart)",
+                     font=ctk.CTkFont(size=13)).pack(anchor="w")
+        ctk.CTkOptionMenu(wrap, values=["blue", "green", "dark-blue"],
+                          variable=color_var).pack(anchor="w", pady=(2, 8))
+
+        scale_var = ctk.DoubleVar(value=float(self.settings.get("ui_scale", 1.0)))
+        scale_lbl = ctk.CTkLabel(wrap, text=f"Interface size:  {scale_var.get():.2f}x",
+                                 font=ctk.CTkFont(size=13))
+        scale_lbl.pack(anchor="w")
+
+        def on_scale(v):
+            scale_lbl.configure(text=f"Interface size:  {float(v):.2f}x")
+            try:
+                ctk.set_widget_scaling(float(v))
+            except Exception:
+                pass
+        ctk.CTkSlider(wrap, from_=0.8, to=1.6, number_of_steps=16, variable=scale_var,
+                      command=on_scale).pack(anchor="w", fill="x", pady=(2, 8))
+
+        # --- Controlling games ---
+        section("Controlling games")
+        sens_var = ctk.DoubleVar(value=float(self.settings.get("sensitivity", 1.0)))
+        sens_lbl = ctk.CTkLabel(wrap, text=f"Mouse-look sensitivity:  {sens_var.get():.2f}x",
+                                font=ctk.CTkFont(size=13))
+        sens_lbl.pack(anchor="w")
+        ctk.CTkSlider(wrap, from_=0.2, to=3.0, number_of_steps=28, variable=sens_var,
+                      command=lambda v: sens_lbl.configure(
+                          text=f"Mouse-look sensitivity:  {float(v):.2f}x")).pack(
+            anchor="w", fill="x", pady=(2, 8))
+
+        # --- Streaming (when this PC is shared) ---
+        section("Streaming  (when this PC is controlled)")
+        fps_var = ctk.IntVar(value=int(self.settings.get("fps", DEFAULT_FPS)))
+        fps_lbl = ctk.CTkLabel(wrap, text=f"Frame rate:  {fps_var.get()} fps",
+                               font=ctk.CTkFont(size=13))
+        fps_lbl.pack(anchor="w")
+        ctk.CTkSlider(wrap, from_=15, to=75, number_of_steps=12, variable=fps_var,
+                      command=lambda v: fps_lbl.configure(
+                          text=f"Frame rate:  {int(float(v))} fps")).pack(
+            anchor="w", fill="x", pady=(2, 8))
+
+        q_var = ctk.IntVar(value=int(self.settings.get("quality", DEFAULT_QUALITY)))
+        q_lbl = ctk.CTkLabel(wrap, text=f"Image quality:  {q_var.get()}",
+                             font=ctk.CTkFont(size=13))
+        q_lbl.pack(anchor="w")
+        ctk.CTkSlider(wrap, from_=50, to=100, number_of_steps=50, variable=q_var,
+                      command=lambda v: q_lbl.configure(
+                          text=f"Image quality:  {int(float(v))}")).pack(
+            anchor="w", fill="x", pady=(2, 8))
+        ctk.CTkLabel(wrap, text="Higher fps / quality look better but use more bandwidth. "
+                               "Changes to streaming apply next time sharing is turned on.",
+                     text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=380,
+                     justify="left").pack(anchor="w", pady=(2, 6))
+
+        status = ctk.CTkLabel(wrap, text="", text_color=GREEN, font=ctk.CTkFont(size=12))
+        status.pack(anchor="w", pady=(8, 0))
+
+        def do_save():
+            self.settings.update({
+                "appearance": appear_var.get(),
+                "theme": color_var.get(),
+                "ui_scale": round(float(scale_var.get()), 2),
+                "sensitivity": round(float(sens_var.get()), 2),
+                "fps": int(fps_var.get()),
+                "quality": int(q_var.get()),
+            })
+            save_settings(self.settings)
+            status.configure(text="✓ Saved.")
+
+        def do_reset():
+            self.settings = dict(DEFAULT_SETTINGS)
+            save_settings(self.settings)
+            ctk.set_appearance_mode(self.settings["appearance"])
+            try:
+                ctk.set_widget_scaling(self.settings["ui_scale"])
+            except Exception:
+                pass
+            win.destroy()
+
+        btns = ctk.CTkFrame(wrap, fg_color="transparent")
+        btns.pack(fill="x", pady=(16, 0))
+        ctk.CTkButton(btns, text="Save", fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      command=do_save).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(btns, text="Save & close", fg_color=GREEN, hover_color="#128a3e",
+                      command=lambda: (do_save(), win.after(150, win.destroy))).pack(side="left")
+        ctk.CTkButton(btns, text="Reset", fg_color="#374151", hover_color="#2c333f",
+                      command=do_reset).pack(side="right")
+
     # ---- session page ----------------------------------------------------
     def _build_session(self):
         self.session = ctk.CTkFrame(self, fg_color=BG)
@@ -593,6 +814,10 @@ class RemoteDesktopApp(ctk.CTk):
                       command=self._stop_control).pack(side="left", padx=8, pady=8)
         self.pause_btn = ctk.CTkButton(bar, text="Pause input", width=110, command=self._toggle_pause)
         self.pause_btn.pack(side="left", padx=4, pady=8)
+        self.game_btn = ctk.CTkButton(bar, text="🎮 Mouse-look: OFF", width=150,
+                                      fg_color="#374151", hover_color="#2c333f",
+                                      command=self._toggle_game)
+        self.game_btn.pack(side="left", padx=4, pady=8)
         ctk.CTkButton(bar, text="Fullscreen", width=100,
                       command=self._toggle_fullscreen).pack(side="left", padx=4, pady=8)
         self.stat_label = ctk.CTkLabel(bar, text="connecting...", text_color=MUTED)
@@ -606,6 +831,10 @@ class RemoteDesktopApp(ctk.CTk):
                                                font=("Segoe UI", 15), text="")
         c = self.canvas
         c.bind("<Motion>", self._on_motion)
+        # also track motion WHILE a button is held — otherwise Tk only sends <B1-Motion>
+        # and you can't look around while mining / dragging (one input at a time)
+        for n in (1, 2, 3):
+            c.bind(f"<B{n}-Motion>", self._on_motion)
         for n in (1, 2, 3):
             c.bind(f"<Button-{n}>", lambda e, n=n: self._on_button(e, n, True))
             c.bind(f"<ButtonRelease-{n}>", lambda e, n=n: self._on_button(e, n, False))
@@ -639,6 +868,8 @@ class RemoteDesktopApp(ctk.CTk):
             self.client.stop()
             self.client = None
         self.client_paired = False
+        if self.game_mode:
+            self._toggle_game()
         if self.fullscreen:
             self._toggle_fullscreen()
         self._show_home()
@@ -654,28 +885,56 @@ class RemoteDesktopApp(ctk.CTk):
         return None
 
     def _on_motion(self, e):
-        if self.client_paired and not self.paused:
+        if not (self.client_paired and not self.paused):
+            return
+        if self.game_mode:
+            cx = self.canvas.winfo_width() // 2
+            cy = self.canvas.winfo_height() // 2
+            dx, dy = e.x - cx, e.y - cy
+            if dx == 0 and dy == 0:
+                return                       # our own warp-to-center event; ignore
+            self._pending_rmove[0] += dx
+            self._pending_rmove[1] += dy
+            try:                             # snap the pointer back so the trackpad never runs out
+                self.canvas.event_generate("<Motion>", warp=True, x=cx, y=cy)
+            except Exception:
+                pass
+        else:
             rel = self._rel(e.x, e.y)
             if rel:
                 self._pending_move = {"type": "move", "x": rel[0], "y": rel[1]}
 
     def _on_button(self, e, n, pressed):
         self.canvas.focus_set()
-        if self.client_paired and not self.paused:
-            rel = self._rel(e.x, e.y)
-            if rel:
-                self.client.send({"type": "click", "button": _MOUSE[n], "pressed": pressed,
-                                  "x": rel[0], "y": rel[1]})
+        if not (self.client_paired and not self.paused):
+            return
+        if self.game_mode:                   # pointer is locked in-game; just press/release
+            self.client.send({"type": "click", "button": _MOUSE[n], "pressed": pressed,
+                              "game": True, "x": 0.5, "y": 0.5})
+            return
+        rel = self._rel(e.x, e.y)
+        if rel:
+            self.client.send({"type": "click", "button": _MOUSE[n], "pressed": pressed,
+                              "x": rel[0], "y": rel[1]})
 
     def _on_wheel(self, e):
-        if self.client_paired and not self.paused:
-            rel = self._rel(e.x, e.y)
-            if rel:
-                self.client.send({"type": "scroll", "dx": 0, "dy": e.delta // 120,
-                                  "x": rel[0], "y": rel[1]})
+        if not (self.client_paired and not self.paused):
+            return
+        if self.game_mode:                   # hotbar scroll without moving the cursor
+            self.client.send({"type": "scroll", "dx": 0, "dy": e.delta // 120,
+                              "game": True, "x": 0.5, "y": 0.5})
+            return
+        rel = self._rel(e.x, e.y)
+        if rel:
+            self.client.send({"type": "scroll", "dx": 0, "dy": e.delta // 120,
+                              "x": rel[0], "y": rel[1]})
 
     def _on_key(self, e, action):
         if e.keysym == "F11":
+            return "break"
+        if e.keysym == "F8":                 # local hotkey: toggle mouse-look (not sent to game)
+            if action == "press":
+                self._toggle_game()
             return "break"
         if self.client_paired and not self.paused:
             if e.keysym in _SPECIAL:
@@ -691,6 +950,28 @@ class RemoteDesktopApp(ctk.CTk):
         self.pause_btn.configure(text="Resume input" if self.paused else "Pause input",
                                  fg_color="#d97706" if self.paused else ["#3a7ebf", "#1f538d"])
 
+    def _toggle_game(self):
+        self.game_mode = not self.game_mode
+        self._pending_rmove = [0, 0]
+        if self.game_mode:
+            self.game_btn.configure(text="🎮 Mouse-look: ON  (F8)", fg_color=GREEN,
+                                    hover_color="#128a3e")
+            self.canvas.configure(cursor="none")
+            self.canvas.focus_set()
+            self._recenter_pointer()
+        else:
+            self.game_btn.configure(text="🎮 Mouse-look: OFF", fg_color="#374151",
+                                    hover_color="#2c333f")
+            self.canvas.configure(cursor="")
+
+    def _recenter_pointer(self):
+        cx = max(self.canvas.winfo_width() // 2, 1)
+        cy = max(self.canvas.winfo_height() // 2, 1)
+        try:
+            self.canvas.event_generate("<Motion>", warp=True, x=cx, y=cy)
+        except Exception:
+            pass
+
     def _toggle_fullscreen(self):
         self.fullscreen = not self.fullscreen
         self.attributes("-fullscreen", self.fullscreen)
@@ -705,6 +986,13 @@ class RemoteDesktopApp(ctk.CTk):
         if self._pending_move is not None:
             self.client.send(self._pending_move)
             self._pending_move = None
+        if self._pending_rmove != [0, 0]:
+            sens = float(self.settings.get("sensitivity", 1.0))
+            dx = int(round(self._pending_rmove[0] * sens))
+            dy = int(round(self._pending_rmove[1] * sens))
+            if dx or dy:
+                self.client.send({"type": "rmove", "dx": dx, "dy": dy})
+            self._pending_rmove = [0, 0]
         if self.client_paired and self.client.frame_counter != self._last_counter:
             self._last_counter = self.client.frame_counter
             frame = self.client.latest_frame
