@@ -115,7 +115,7 @@ MIN_QUALITY = 60                      # quality floor when shedding load
 SCALE = 1.0                           # capture at native resolution (ceiling)
 SMOOTH_MIN_SCALE = 0.5                # "Smoothest": may drop to half-res to hold the frame rate
 SHARP_MIN_SCALE = 1.0                 # "Sharpest": never downscale (fps may suffer on big screens)
-BIG_FRAME_PIXELS = 2_100_000          # above ~1080p, use faster 4:2:0 chroma instead of 4:4:4
+BIG_FRAME_PIXELS = 1_300_000          # above ~900p (incl. 1080p) use fast 4:2:0 chroma; 4:4:4 only for small frames
 SMOOTH_TARGET_W = 1920                 # "Smoothest" starts capped near this width on big screens
 DIFF_THRESHOLD = 1.2
 KEYFRAME_EVERY = 2.0
@@ -356,7 +356,7 @@ def _draw_cursor(img, x, y):
 
 class ScreenGrabber:
     """bettercam (Desktop Duplication, captures games) with mss fallback. One thread only."""
-    def __init__(self, monitor_index, target_fps=60):
+    def __init__(self, monitor_index, target_fps=75):
         self.backend = "mss"
         self.cam = None
         self._sct = None
@@ -390,7 +390,10 @@ class ScreenGrabber:
 
     def grab_jpeg(self, quality, scale, force):
         if self.cam is not None:
-            frame = self.cam.get_latest_frame()
+            try:
+                frame = self.cam.get_latest_frame()
+            except Exception:
+                frame = None                      # e.g. a game grabbed exclusive fullscreen
             if frame is None:
                 if self._last_full is None:
                     return None
@@ -425,12 +428,14 @@ class ScreenGrabber:
         return buf.tobytes() if ok else None
 
     def close(self):
+        # Only stop() the capture thread. We deliberately DON'T call release():
+        # bettercam's COM release can throw a native access violation that can
+        # crash the whole process. Dropping the reference lets it clean up safely.
         try:
-            if self.cam is not None:
-                if self._started:
-                    self.cam.stop()
-                self.cam.release()
+            if self.cam is not None and self._started:
+                self.cam.stop()
         except Exception: pass
+        self.cam = None
         try:
             if self._sct is not None: self._sct.close()
         except Exception: pass
@@ -1263,6 +1268,9 @@ class RemoteDesktopApp(ctk.CTk):
 
         import tkinter as tk
         self.canvas = tk.Canvas(self.session, bg="#000000", highlightthickness=0)
+        # Hide the LOCAL cursor over the video — the remote PC's real cursor is drawn
+        # into the stream, so showing the local one too gives a confusing "two mice".
+        self.canvas.configure(cursor="none")
         self.canvas.pack(fill="both", expand=True)
         self._img_id = self.canvas.create_image(0, 0, anchor="nw")
         self._msg_id = self.canvas.create_text(24, 24, anchor="nw", fill="#c7cbd4",
@@ -1491,14 +1499,11 @@ class RemoteDesktopApp(ctk.CTk):
         if self.game_mode:
             self.game_btn.configure(text="🎮 Mouse-look: ON  (F8)", fg_color=ACCENT,
                                     text_color=ON_ACCENT, border_color=ACCENT, hover_color=ACCENT_HOVER)
-            # hide the local cursor while locked — in-game there is no cursor to show
-            self.canvas.configure(cursor="none")
-            self.canvas.focus_set()
+            self.canvas.focus_set()             # cursor is already hidden over the canvas
             self._recenter_pointer()
         else:
             self.game_btn.configure(text="🎮 Mouse-look: OFF", fg_color="transparent",
                                     text_color=TEXT_BODY, border_color=BORDER, hover_color=SURF_HOVER)
-            self.canvas.configure(cursor="")
 
     def _recenter_pointer(self):
         cx = max(self.canvas.winfo_width() // 2, 1)
