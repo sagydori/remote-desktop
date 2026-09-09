@@ -91,14 +91,30 @@ USE_BETTERCAM = True
 DEFAULT_QUALITY = 90                  # high quality; edges/text stay crisp
 DEFAULT_FPS = 60                      # smooth 60 fps
 
-# palette
-BG = "#12141a"
-CARD = "#1b1e26"
-ACCENT = "#3b82f6"
-ACCENT_HOVER = "#2f6ad0"
-GREEN = "#16a34a"
-RED = "#b91c1c"
-MUTED = "#8b93a1"
+# palette  —  cyan-on-deep-navy "command console" (dark base + one neon accent)
+BG          = "#0A0E14"   # deepest window background
+BG_LAYER    = "#0F1520"   # behind cards
+CARD        = "#151C28"   # card / toolbar surface
+SURF_HOVER  = "#1B2433"   # elevated / hover surface
+SURF_INSET  = "#0C121B"   # inputs, HUD bar, icon discs
+BORDER      = "#232D3D"   # default 1px border
+DIVIDER     = "#1A2230"   # hairline separators
+ACCENT      = "#22D3EE"   # primary accent (cyan)
+ACCENT_HOVER= "#4FE0F5"   # accent hover
+ACCENT_LO   = "#0FB4D0"   # accent pressed
+ACCENT_DIM  = "#155E75"   # glow ring / faint accent
+ON_ACCENT   = "#08141B"   # dark text to sit on a solid-accent button
+GREEN       = "#34D399"   # ON / connected
+GREEN_HALO  = "#10704F"   # pulsing halo behind the ON dot
+RED         = "#F87171"   # danger / disconnect (used as ghost text)
+RED_DIM     = "#7F2A2A"   # danger hover fill
+WARNING     = "#FBBF24"   # connecting / degraded
+TEXT        = "#E6EDF6"   # headings / primary text
+TEXT_BODY   = "#9FB0C3"   # body text
+MUTED       = "#64748B"   # captions / eyebrows / disabled
+GRAD = ("#22D3EE", "#38BDF8", "#3B82F6")   # cyan -> sky -> blue accent gradient
+FONT_UI = "Segoe UI"      # native on Windows 11
+FONT_MONO = "Consolas"    # native monospace for the stat readout
 
 _SPECIAL = {
     "Return": "enter", "KP_Enter": "enter", "Escape": "esc", "BackSpace": "backspace",
@@ -143,6 +159,28 @@ def save_settings(s):
             json.dump(s, f, indent=2)
     except Exception:
         pass
+
+
+def _gradient_image(width, height, stops=GRAD):
+    """A horizontal accent gradient as a CTkImage (used for thin accent underlines)."""
+    w = max(int(width), 1)
+    cols = [tuple(int(s[i:i + 2], 16) for i in (1, 3, 5)) for s in stops]
+    segs = len(cols) - 1
+    row = Image.new("RGB", (w, 1))
+    for x in range(w):
+        fpos = (x / max(w - 1, 1)) * segs
+        i = min(int(fpos), segs - 1)
+        f = fpos - i
+        c0, c1 = cols[i], cols[i + 1]
+        row.putpixel((x, 0), tuple(int(c0[j] + (c1[j] - c0[j]) * f) for j in range(3)))
+    return ctk.CTkImage(row, size=(w, max(int(height), 1)))
+
+
+def _blend(a, b, t):
+    """Blend two #rrggbb colors; t in [0,1]."""
+    ca = tuple(int(a[i:i + 2], 16) for i in (1, 3, 5))
+    cb = tuple(int(b[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % tuple(int(ca[j] + (cb[j] - ca[j]) * t) for j in range(3))
 
 
 # ===========================================================================
@@ -605,8 +643,12 @@ class RemoteDesktopApp(ctk.CTk):
             pass
         self.title("doris pccontrol")
         self.geometry("1280x820")
-        self.minsize(820, 560)
+        self.minsize(960, 640)
         self.configure(fg_color=BG)
+        try:
+            self.attributes("-alpha", 0.0)     # fade in on launch
+        except Exception:
+            pass
         try:
             self.iconbitmap(ICON)
         except Exception:
@@ -653,6 +695,19 @@ class RemoteDesktopApp(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(80, self._poll)
         self.after(400, self._reassert_icon)   # CTk can reset the icon after init
+        self.after(60, self._fade_in)
+
+    def _fade_in(self):
+        try:
+            a = min(1.0, (self.attributes("-alpha") or 0.0) + 0.12)
+            self.attributes("-alpha", a)
+            if a < 1.0:
+                self.after(16, self._fade_in)
+        except Exception:
+            try:
+                self.attributes("-alpha", 1.0)
+            except Exception:
+                pass
 
     def _reassert_icon(self):
         try:
@@ -660,68 +715,167 @@ class RemoteDesktopApp(ctk.CTk):
         except Exception:
             pass
 
+    # ---- futuristic building blocks -------------------------------------
+    def _corner_brackets(self, parent, color=ACCENT_DIM, size=16, thick=2, pad=10):
+        """Four L-shaped HUD brackets in the corners of `parent`."""
+        for relx, anchor in ((0.0, "nw"), (1.0, "ne")):
+            for rely, va in ((0.0, "n"), (1.0, "s")):
+                ax = ("w" if relx == 0.0 else "e")
+                cy = ("n" if rely == 0.0 else "s")
+                h = ctk.CTkFrame(parent, width=size, height=thick, fg_color=color,
+                                 corner_radius=0)
+                h.place(relx=relx, rely=rely, anchor=cy + ax,
+                        x=(pad if relx == 0 else -pad), y=(pad if rely == 0 else -pad))
+                v = ctk.CTkFrame(parent, width=thick, height=size, fg_color=color,
+                                 corner_radius=0)
+                v.place(relx=relx, rely=rely, anchor=cy + ax,
+                        x=(pad if relx == 0 else -pad), y=(pad if rely == 0 else -pad))
+
+    def _accent_underline(self, parent, width=44, height=2):
+        img = _gradient_image(width, height)
+        lbl = ctk.CTkLabel(parent, text="", image=img)
+        lbl._img_ref = img
+        return lbl
+
     # ---- home page -------------------------------------------------------
     def _build_home(self):
         self.home = ctk.CTkFrame(self, fg_color=BG)
 
+        # faint dot-grid texture behind everything
+        import tkinter as tk
+        self._grid_canvas = tk.Canvas(self.home, bg=BG, highlightthickness=0, bd=0)
+        self._grid_canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._grid_canvas.bind("<Configure>", self._draw_grid)
+
         header = ctk.CTkFrame(self.home, fg_color="transparent")
-        header.pack(fill="x", padx=28, pady=(20, 0))
+        header.pack(fill="x", padx=32, pady=(22, 0))
         if self._icon_img is not None:
             ctk.CTkLabel(header, image=self._icon_img, text="").pack(side="left")
-        ctk.CTkLabel(header, text="  doris pccontrol",
-                     font=ctk.CTkFont(size=20, weight="bold")).pack(side="left")
-        ctk.CTkButton(header, text="⚙  Settings", width=110, fg_color="#374151",
-                      hover_color="#2c333f", command=self._open_settings).pack(side="right")
-        ctk.CTkLabel(header, text=f"This PC:  {NAME}    ", text_color=MUTED,
-                     font=ctk.CTkFont(size=13)).pack(side="right")
+        brand = ctk.CTkFrame(header, fg_color="transparent")
+        brand.pack(side="left", padx=(8, 0))
+        row = ctk.CTkFrame(brand, fg_color="transparent"); row.pack(anchor="w")
+        ctk.CTkLabel(row, text="doris ", text_color=TEXT,
+                     font=ctk.CTkFont(FONT_UI, 24, weight="bold")).pack(side="left")
+        ctk.CTkLabel(row, text="pccontrol", text_color=ACCENT,
+                     font=ctk.CTkFont(FONT_UI, 24, weight="bold")).pack(side="left")
+        self._accent_underline(brand, width=120, height=2).pack(anchor="w", pady=(3, 0))
 
-        card = ctk.CTkFrame(self.home, corner_radius=22, fg_color=CARD)
-        card.place(relx=0.5, rely=0.52, anchor="center")
-        inner = ctk.CTkFrame(card, fg_color="transparent")
-        inner.pack(padx=56, pady=44)
+        ctk.CTkButton(header, text="⚙  Settings", width=104, height=34, corner_radius=17,
+                      fg_color="transparent", border_width=1, border_color=BORDER,
+                      hover_color=SURF_HOVER, text_color=TEXT_BODY,
+                      command=self._open_settings).pack(side="right")
+        ctk.CTkLabel(header, text=f"This PC · {NAME}    ", text_color=MUTED,
+                     font=ctk.CTkFont(FONT_UI, 13)).pack(side="right")
 
-        # Section 1 — control the other PC
-        ctk.CTkLabel(inner, text="CONTROL YOUR OTHER PC", text_color="#7c8698",
-                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w")
-        ctk.CTkLabel(inner, text="Take over the other computer's screen.",
-                     text_color="#c7cbd4", font=ctk.CTkFont(size=13)).pack(anchor="w", pady=(2, 12))
+        # two action cards, side by side
+        grid = ctk.CTkFrame(self.home, fg_color="transparent")
+        grid.pack(expand=True, padx=32, pady=18)
+        c1 = self._make_card(grid, "◈", "Control your other PC",
+                             f"Take over {PEER or 'the other computer'}'s screen and mouse.",
+                             accent=True)
+        c2 = self._make_card(grid, "⊚", "Allow this PC to be controlled",
+                             "Turn on and leave the app open so your other PC can connect.",
+                             accent=False)
+        c1.grid(row=0, column=0, padx=(0, 12), sticky="nsew")
+        c2.grid(row=0, column=1, padx=(12, 0), sticky="nsew")
+        grid.grid_columnconfigure((0, 1), weight=1, uniform="cards")
+        grid.grid_rowconfigure(0, weight=1)
+
+        # --- card 1 action: connect button ---
         self.control_btn = ctk.CTkButton(
-            inner, text=f"🖥   Control  {PEER or 'other PC'}", height=56, width=400,
-            corner_radius=12, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-            font=ctk.CTkFont(size=17, weight="bold"), command=self._start_control)
-        self.control_btn.pack(fill="x")
+            c1.body, text=f"Connect  →", height=48, corner_radius=10,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=ON_ACCENT,
+            font=ctk.CTkFont(FONT_UI, 15, weight="bold"), command=self._start_control)
+        self.control_btn.pack(fill="x", side="bottom")
 
-        ctk.CTkFrame(inner, height=1, fg_color="#2b2f3a").pack(fill="x", pady=24)
-
-        # Section 2 — allow this PC to be controlled
-        ctk.CTkLabel(inner, text="LET YOUR OTHER PC CONTROL THIS ONE", text_color="#7c8698",
-                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w")
-        ctk.CTkLabel(inner, text="Turn on, then leave the app open, to allow access.",
-                     text_color="#c7cbd4", font=ctk.CTkFont(size=13)).pack(anchor="w", pady=(2, 12))
+        # --- card 2 action: status dot + switch ---
+        arow = ctk.CTkFrame(c2.body, fg_color="transparent")
+        arow.pack(fill="x", side="bottom")
+        dotwrap = ctk.CTkFrame(arow, width=22, height=22, corner_radius=11, fg_color=BG_LAYER)
+        dotwrap.pack(side="left"); dotwrap.pack_propagate(False)
+        self.dot_halo = ctk.CTkFrame(dotwrap, width=18, height=18, corner_radius=9, fg_color=BG_LAYER)
+        self.dot_halo.place(relx=0.5, rely=0.5, anchor="center")
+        self.dot = ctk.CTkLabel(self.dot_halo, text="●", text_color="#41506a",
+                                font=ctk.CTkFont(FONT_UI, 12))
+        self.dot.place(relx=0.5, rely=0.5, anchor="center")
+        self.share_label = ctk.CTkLabel(arow, text="Sharing off", text_color=MUTED,
+                                        font=ctk.CTkFont(FONT_UI, 13))
+        self.share_label.pack(side="left", padx=(8, 0))
         self.share_btn = ctk.CTkButton(
-            inner, text="🔓   Allow this PC to be controlled", height=56, width=400,
-            corner_radius=12, fg_color="#374151", hover_color="#2c333f",
-            font=ctk.CTkFont(size=16, weight="bold"), command=self._toggle_share)
-        self.share_btn.pack(fill="x")
-        srow = ctk.CTkFrame(inner, fg_color="transparent")
-        srow.pack(anchor="w", pady=(12, 0))
-        self.dot = ctk.CTkLabel(srow, text="●", text_color="#6b7280", font=ctk.CTkFont(size=16))
-        self.dot.pack(side="left", padx=(0, 8))
-        self.share_label = ctk.CTkLabel(srow, text="Off — not shareable", text_color=MUTED,
-                                        font=ctk.CTkFont(size=13))
-        self.share_label.pack(side="left")
+            arow, text="Turn on", width=96, height=34, corner_radius=17,
+            fg_color="transparent", border_width=1, border_color=BORDER,
+            hover_color=SURF_HOVER, text_color=TEXT,
+            font=ctk.CTkFont(FONT_UI, 13, weight="bold"), command=self._toggle_share)
+        self.share_btn.pack(side="right")
 
-        self.home_status = ctk.CTkLabel(inner, text="", text_color="#f59e0b",
-                                        font=ctk.CTkFont(size=13), wraplength=400, justify="left")
-        self.home_status.pack(anchor="w", pady=(16, 0))
+        self.home_status = ctk.CTkLabel(self.home, text="", text_color=WARNING,
+                                        font=ctk.CTkFont(FONT_UI, 13), wraplength=760,
+                                        justify="left")
+        self.home_status.pack(padx=34, pady=(0, 18))
 
         if not PEER or not SECRET:
-            self.control_btn.configure(state="disabled", text="🖥   Run Setup first")
+            self.control_btn.configure(state="disabled", text="Run Setup first")
             self.home_status.configure(text="⚠  Not set up yet — run the Setup Wizard (INSTALL.bat).")
         elif NAME and NAME != "this PC" and PEER.strip().lower() == NAME.strip().lower():
             self.home_status.configure(
                 text="⚠  The other-PC name is the same as this PC. Re-run Setup and enter the "
                      "OTHER computer's Tailscale name.")
+        self._pulse_dot()
+
+    def _make_card(self, parent, glyph, title, subtitle, accent):
+        """A HUD-style action card. Returns the card frame with a `.body` for actions."""
+        card = ctk.CTkFrame(parent, corner_radius=16, fg_color=CARD,
+                            border_width=1, border_color=(ACCENT_DIM if accent else BORDER))
+        card.configure(width=340, height=230)
+        pad = ctk.CTkFrame(card, fg_color="transparent")
+        pad.pack(fill="both", expand=True, padx=22, pady=20)
+        self._corner_brackets(card, color=(ACCENT_DIM if accent else BORDER))
+
+        disc = ctk.CTkFrame(pad, width=46, height=46, corner_radius=23, fg_color=SURF_INSET,
+                            border_width=1, border_color=(ACCENT_DIM if accent else BORDER))
+        disc.pack(anchor="w"); disc.pack_propagate(False)
+        ctk.CTkLabel(disc, text=glyph, text_color=(ACCENT if accent else TEXT_BODY),
+                     font=ctk.CTkFont(FONT_UI, 22)).place(relx=0.5, rely=0.5, anchor="center")
+
+        ctk.CTkLabel(pad, text=title, text_color=TEXT, justify="left",
+                     font=ctk.CTkFont(FONT_UI, 17, weight="bold")).pack(anchor="w", pady=(14, 0))
+        if accent:
+            self._accent_underline(pad, width=40, height=2).pack(anchor="w", pady=(4, 0))
+        ctk.CTkLabel(pad, text=subtitle, text_color=TEXT_BODY, justify="left", wraplength=280,
+                     font=ctk.CTkFont(FONT_UI, 13)).pack(anchor="w", pady=(8, 0))
+
+        card.body = ctk.CTkFrame(pad, fg_color="transparent")
+        card.body.pack(fill="x", side="bottom", pady=(16, 0))
+
+        def enter(_):
+            card.configure(fg_color=SURF_HOVER, border_color=ACCENT)
+        def leave(_):
+            card.configure(fg_color=CARD, border_color=(ACCENT_DIM if accent else BORDER))
+        for w in (card, pad):
+            w.bind("<Enter>", enter); w.bind("<Leave>", leave)
+        return card
+
+    def _draw_grid(self, event):
+        c = self._grid_canvas
+        c.delete("grid")
+        step = 34
+        for x in range(0, event.width, step):
+            for y in range(0, event.height, step):
+                c.create_oval(x, y, x + 2, y + 2, fill="#141c28", outline="", tags="grid")
+        c.lower("grid")
+
+    def _pulse_dot(self):
+        # Breathing halo behind the sharing status dot; color depends on host state.
+        self._pulse_t = getattr(self, "_pulse_t", 0.0) + 0.08
+        import math
+        f = (math.sin(self._pulse_t) + 1) / 2
+        if self.host_state == "ready":
+            self.dot_halo.configure(fg_color=_blend(GREEN_HALO, GREEN, f))
+        elif self.host_state == "controlled":
+            self.dot_halo.configure(fg_color=_blend(ACCENT_DIM, ACCENT, f))
+        else:
+            self.dot_halo.configure(fg_color=BG_LAYER)
+        self.after(60, self._pulse_dot)
 
     # ---- share (host) toggle --------------------------------------------
     def _toggle_share(self):
@@ -735,16 +889,16 @@ class RemoteDesktopApp(ctk.CTk):
                                 min_scale=min_scale)
         self.host.start()
         self.sharing = True
-        self.share_btn.configure(text="🔒   Stop allowing control", fg_color=RED,
-                                 hover_color="#991b1b")
+        self.share_btn.configure(text="Turn off", border_color=RED, text_color=RED,
+                                 hover_color=RED_DIM)
 
     def _stop_share(self):
         if self.host:
             self.host.stop()
             self.host = None
         self.sharing = False
-        self.share_btn.configure(text="🔓   Allow this PC to be controlled",
-                                 fg_color="#374151", hover_color="#2c333f")
+        self.share_btn.configure(text="Turn on", border_color=BORDER, text_color=TEXT,
+                                 hover_color=SURF_HOVER)
         self._apply_host_state("off")
 
     # ---- settings window -------------------------------------------------
@@ -882,22 +1036,32 @@ class RemoteDesktopApp(ctk.CTk):
                       command=do_reset).pack(side="right")
 
     # ---- session page ----------------------------------------------------
+    def _pill(self, parent, text, command, width=118, danger=False):
+        return ctk.CTkButton(
+            parent, text=text, width=width, height=32, corner_radius=16,
+            fg_color="transparent", border_width=1,
+            border_color=(RED if danger else BORDER),
+            text_color=(RED if danger else TEXT_BODY),
+            hover_color=(RED_DIM if danger else SURF_HOVER),
+            font=ctk.CTkFont(FONT_UI, 13, weight="bold"), command=command)
+
     def _build_session(self):
         self.session = ctk.CTkFrame(self, fg_color=BG)
-        bar = ctk.CTkFrame(self.session, height=50, corner_radius=0, fg_color="#0f1116")
+        bar = ctk.CTkFrame(self.session, height=52, corner_radius=0, fg_color=SURF_INSET,
+                           border_width=0)
         bar.pack(fill="x", side="top")
-        ctk.CTkButton(bar, text="← Disconnect", width=120, fg_color=RED, hover_color="#991b1b",
-                      command=self._stop_control).pack(side="left", padx=8, pady=8)
-        self.pause_btn = ctk.CTkButton(bar, text="Pause input", width=110, command=self._toggle_pause)
-        self.pause_btn.pack(side="left", padx=4, pady=8)
-        self.game_btn = ctk.CTkButton(bar, text="🎮 Mouse-look: OFF", width=150,
-                                      fg_color="#374151", hover_color="#2c333f",
-                                      command=self._toggle_game)
-        self.game_btn.pack(side="left", padx=4, pady=8)
-        ctk.CTkButton(bar, text="Fullscreen", width=100,
-                      command=self._toggle_fullscreen).pack(side="left", padx=4, pady=8)
-        self.stat_label = ctk.CTkLabel(bar, text="connecting...", text_color=MUTED)
-        self.stat_label.pack(side="right", padx=14)
+        ctk.CTkFrame(bar, height=1, fg_color=ACCENT_DIM).pack(fill="x", side="bottom")
+        self._pill(bar, "← Disconnect", self._stop_control, width=124, danger=True).pack(
+            side="left", padx=(10, 6), pady=9)
+        self.pause_btn = self._pill(bar, "Pause input", self._toggle_pause)
+        self.pause_btn.pack(side="left", padx=4, pady=9)
+        self.game_btn = self._pill(bar, "🎮 Mouse-look: OFF", self._toggle_game, width=168)
+        self.game_btn.pack(side="left", padx=4, pady=9)
+        self._pill(bar, "⛶ Fullscreen", self._toggle_fullscreen, width=118).pack(
+            side="left", padx=4, pady=9)
+        self.stat_label = ctk.CTkLabel(bar, text="connecting…", text_color=TEXT_BODY,
+                                       font=ctk.CTkFont(FONT_MONO, 13))
+        self.stat_label.pack(side="right", padx=16)
 
         import tkinter as tk
         self.canvas = tk.Canvas(self.session, bg="#000000", highlightthickness=0)
@@ -1030,22 +1194,27 @@ class RemoteDesktopApp(ctk.CTk):
 
     def _toggle_pause(self):
         self.paused = not self.paused
-        self.pause_btn.configure(text="Resume input" if self.paused else "Pause input",
-                                 fg_color="#d97706" if self.paused else ["#3a7ebf", "#1f538d"])
+        if self.paused:
+            self.pause_btn.configure(text="Resume input", fg_color=WARNING, text_color=ON_ACCENT,
+                                     border_color=WARNING, hover_color=WARNING)
+        else:
+            self.pause_btn.configure(text="Pause input", fg_color="transparent",
+                                     text_color=TEXT_BODY, border_color=BORDER,
+                                     hover_color=SURF_HOVER)
 
     def _toggle_game(self):
         self.game_mode = not self.game_mode
         self._pending_rmove = [0, 0]
         if self.game_mode:
-            self.game_btn.configure(text="🎮 Mouse-look: ON  (F8)", fg_color=GREEN,
-                                    hover_color="#128a3e")
+            self.game_btn.configure(text="🎮 Mouse-look: ON  (F8)", fg_color=ACCENT,
+                                    text_color=ON_ACCENT, border_color=ACCENT, hover_color=ACCENT_HOVER)
             # show a crosshair reticle at the locked center instead of hiding the cursor
             self.canvas.configure(cursor="crosshair")
             self.canvas.focus_set()
             self._recenter_pointer()
         else:
-            self.game_btn.configure(text="🎮 Mouse-look: OFF", fg_color="#374151",
-                                    hover_color="#2c333f")
+            self.game_btn.configure(text="🎮 Mouse-look: OFF", fg_color="transparent",
+                                    text_color=TEXT_BODY, border_color=BORDER, hover_color=SURF_HOVER)
             self.canvas.configure(cursor="")
 
     def _recenter_pointer(self):
@@ -1147,13 +1316,13 @@ class RemoteDesktopApp(ctk.CTk):
         self.host_state = state
         if state == "ready":
             self.dot.configure(text_color=GREEN)
-            self.share_label.configure(text="On — your other PC can connect")
+            self.share_label.configure(text="Sharing on — ready", text_color=TEXT_BODY)
         elif state == "controlled":
             self.dot.configure(text_color=ACCENT)
-            self.share_label.configure(text="Your other PC is controlling this one now")
+            self.share_label.configure(text="Being controlled now", text_color=ACCENT)
         else:
-            self.dot.configure(text_color="#6b7280")
-            self.share_label.configure(text="Off — not shareable")
+            self.dot.configure(text_color="#41506a")
+            self.share_label.configure(text="Sharing off", text_color=MUTED)
 
     def _poll(self):
         try:
@@ -1181,10 +1350,21 @@ class RemoteDesktopApp(ctk.CTk):
         except queue.Empty:
             pass
         if self.client_paired:
-            rtt = "--" if self.rtt is None else f"{self.rtt:.0f}ms"
+            rtt = "-- ms" if self.rtt is None else f"{self.rtt:.0f} ms"
+            mbps = self._kbps() / 1024.0
             self.stat_label.configure(
-                text=f"{self._fps_val():.0f} fps   {self._kbps():.0f} KB/s   RTT {rtt}   q{self.q} {self.scale}x")
+                text=f"{self._fps_val():.0f} fps · {mbps:.1f} MB/s · {rtt} · q{self.q} {self.scale}x",
+                text_color=self._rtt_color())
         self.after(120, self._poll)
+
+    def _rtt_color(self):
+        if self.rtt is None:
+            return TEXT_BODY
+        if self.rtt <= 40:
+            return GREEN
+        if self.rtt <= 100:
+            return WARNING
+        return RED
 
     def _on_close(self):
         if self.client: self.client.stop()
