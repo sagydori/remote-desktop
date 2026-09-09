@@ -49,6 +49,12 @@ PEER = getattr(config, "PEER", "") or getattr(config, "HOST", "")
 PORT = getattr(config, "PORT", 8765)
 SECRET = getattr(config, "SECRET", "")
 
+try:
+    with open(os.path.join(HERE, "VERSION"), encoding="utf-8") as _vf:
+        APP_VERSION = _vf.read().strip() or "?"
+except Exception:
+    APP_VERSION = "?"
+
 # ---- Windows raw relative mouse motion (for in-game camera / mouse-look) ----
 # Games (Minecraft, FPS titles) grab the pointer and read RAW motion deltas.
 # Setting an absolute cursor position doesn't turn the camera; injecting a
@@ -697,7 +703,7 @@ class RemoteDesktopApp(ctk.CTk):
             ctk.set_widget_scaling(float(self.settings.get("ui_scale", 1.0)))
         except Exception:
             pass
-        self.title("doris pccontrol")
+        self.title(f"doris pccontrol  ·  v{APP_VERSION}")
         self.geometry("1280x820")
         self.minsize(960, 640)
         self.configure(fg_color=BG)
@@ -821,8 +827,13 @@ class RemoteDesktopApp(ctk.CTk):
                       fg_color="transparent", border_width=1, border_color=BORDER,
                       hover_color=SURF_HOVER, text_color=TEXT_BODY,
                       command=self._open_settings).pack(side="right")
-        ctk.CTkLabel(header, text=f"This PC · {NAME}    ", text_color=MUTED,
-                     font=ctk.CTkFont(FONT_UI, 13)).pack(side="right")
+        ver = ctk.CTkFrame(header, corner_radius=12, fg_color=SURF_INSET,
+                           border_width=1, border_color=BORDER)
+        ver.pack(side="right", padx=10)
+        ctk.CTkLabel(ver, text=f"v{APP_VERSION}", text_color=ACCENT,
+                     font=ctk.CTkFont(FONT_MONO, 12, weight="bold")).pack(padx=10, pady=4)
+        ctk.CTkLabel(header, text=f"This PC · {NAME}", text_color=MUTED,
+                     font=ctk.CTkFont(FONT_UI, 13)).pack(side="right", padx=(0, 4))
 
         # two action cards, side by side
         grid = ctk.CTkFrame(self.home, fg_color="transparent")
