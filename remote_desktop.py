@@ -139,6 +139,7 @@ DEFAULT_SETTINGS = {
     "priority": "smooth",       # smooth (hold fps, may drop resolution) | sharp (lock full res)
     "sensitivity": 1.0,         # mouse-look turn speed multiplier
     "ui_scale": 1.0,            # overall GUI size (widget scaling)
+    "conn_preset": "balanced",  # last quality preset picked before controlling
 }
 
 
@@ -415,13 +416,17 @@ class HostBackend:
             self._capture.close()
 
     async def _auth(self, ws):
+        prefs = {}
         try:
             first = await asyncio.wait_for(ws.recv(), timeout=10)
-            ok = isinstance(first, str) and json.loads(first).get("token") == SECRET
+            data = json.loads(first) if isinstance(first, str) else {}
+            ok = data.get("token") == SECRET
+            if ok and isinstance(data.get("prefs"), dict):
+                prefs = data["prefs"]
         except Exception:
             ok = False
         await ws.send(json.dumps({"type": "auth", "ok": ok}))
-        return ok
+        return ok, prefs
 
     async def _handle(self, ws):
         addr = ws.remote_address[0] if ws.remote_address else "?"
@@ -431,7 +436,8 @@ class HostBackend:
             try: await ws.close()
             except Exception: pass
             return
-        if not await self._auth(ws):
+        authok, prefs = await self._auth(ws)
+        if not authok:
             await ws.close(); return
         # Take over any existing session instead of rejecting as "busy": a reconnect
         # from the same user should replace a stale/zombie session, not be blocked.
@@ -443,19 +449,29 @@ class HostBackend:
         geo = monitor_geometry(self.monitor_index)
         controller = InputController(*geo)
         mon_w = max(geo[2], 1)
-        # "Smoothest" starts capped near 1080p on big screens so it's fluid from the
-        # first frame instead of lagging while it adapts down; "Sharpest" stays native.
-        if self.min_scale < 1.0 and mon_w > SMOOTH_TARGET_W:
-            cap = round(SMOOTH_TARGET_W / mon_w, 2)
-            encoder = AdaptiveEncoder(self.quality, min_scale=self.min_scale,
-                                      start_scale=cap, max_scale=cap)
+
+        # The CONTROLLER picks quality/resolution/fps for this session (its "prefs");
+        # fall back to this PC's saved settings when none are sent.
+        quality = int(prefs.get("quality", self.quality))
+        fps = int(prefs.get("fps", 0) or 0)
+        interval = (1.0 / max(1, fps)) if fps else self.interval
+        sharp = bool(prefs.get("sharp", self.min_scale >= 1.0))
+        target_w = int(prefs.get("target_w", 0) or 0)   # 0 = native
+        min_scale = SHARP_MIN_SCALE if sharp else SMOOTH_MIN_SCALE
+        if sharp:
+            start = maxs = 1.0
+        elif target_w and mon_w > target_w:             # cap to the chosen width
+            start = maxs = round(target_w / mon_w, 2)
+        elif mon_w > SMOOTH_TARGET_W:                   # big screen, no explicit target
+            start = maxs = round(SMOOTH_TARGET_W / mon_w, 2)
         else:
-            encoder = AdaptiveEncoder(self.quality, min_scale=self.min_scale)
+            start = maxs = 1.0
+        encoder = AdaptiveEncoder(quality, min_scale=min_scale, start_scale=start, max_scale=maxs)
         paired = asyncio.Event(); paired.set()
         try:
             tasks = [
                 asyncio.create_task(self._read(ws, controller)),
-                asyncio.create_task(self._stream(ws, self._capture, encoder, paired)),
+                asyncio.create_task(self._stream(ws, self._capture, encoder, paired, interval)),
                 asyncio.create_task(my_stop.wait()),
                 asyncio.create_task(self._async_stop.wait()),
             ]
@@ -494,8 +510,9 @@ class HostBackend:
             else:
                 controller.handle(data)
 
-    async def _stream(self, ws, capture, encoder, paired):
+    async def _stream(self, ws, capture, encoder, paired, interval=None):
         loop = asyncio.get_running_loop()
+        interval = interval or self.interval
         last_key = last_stat = 0.0
 
         def submit(now):
@@ -516,14 +533,14 @@ class HostBackend:
                     await ws.send(jpeg)
                     last_key = start
                 # React to the WHOLE frame cost (grab + encode + send), not just send.
-                encoder.note_frame_time(loop.time() - start, self.interval)
+                encoder.note_frame_time(loop.time() - start, interval)
                 if start - last_stat >= 1.0:
                     await ws.send(json.dumps({"type": "stat", "q": encoder.quality,
                                               "scale": encoder.scale}))
                     last_stat = start
                 elapsed = loop.time() - start
-                if elapsed < self.interval:
-                    await asyncio.sleep(self.interval - elapsed)
+                if elapsed < interval:
+                    await asyncio.sleep(interval - elapsed)
         finally:
             pending.cancel()
 
@@ -532,9 +549,10 @@ class HostBackend:
 #  CLIENT side: connect out to the OTHER PC to control it
 # ===========================================================================
 class ClientBackend:
-    def __init__(self, peer, events):
+    def __init__(self, peer, events, prefs=None):
         self.uri = f"ws://{peer}:{PORT}"
         self.events = events
+        self.prefs = prefs or {}          # quality/resolution chosen for THIS session
         self.loop = None
         self._async_stop = None
         self._outgoing = None
@@ -576,7 +594,8 @@ class ClientBackend:
                 self._emit("status", f"Connecting to {PEER} ...")
                 async with websockets.connect(self.uri, max_size=None,
                                               ping_interval=10, ping_timeout=10) as ws:
-                    await ws.send(json.dumps({"type": "auth", "token": SECRET}))
+                    await ws.send(json.dumps({"type": "auth", "token": SECRET,
+                                              "prefs": self.prefs}))
                     reply = json.loads(await asyncio.wait_for(ws.recv(), 10))
                     if not reply.get("ok", False):
                         raise ConnectionError("wrong password")
@@ -711,6 +730,7 @@ class RemoteDesktopApp(ctk.CTk):
         self._photo = None
         self._pending_move = None
         self._pending_rmove = [0, 0]
+        self._lock_last = None          # last pointer pos while in mouse-look mode
         self._fps = deque(maxlen=60)
         self._bytes = deque(maxlen=120)
         self.rtt = None
@@ -1136,11 +1156,63 @@ class RemoteDesktopApp(ctk.CTk):
         self.canvas.focus_set()
 
     # ---- control (client) start/stop ------------------------------------
+    # Quality presets the user picks before every session.
+    CONN_PRESETS = [
+        ("smooth", "⚡  Smooth", "720p · fastest, lowest lag",
+         {"target_w": 1280, "quality": 78, "fps": 60, "sharp": False}),
+        ("balanced", "⚖  Balanced", "1080p · good balance (recommended)",
+         {"target_w": 1920, "quality": 88, "fps": 60, "sharp": False}),
+        ("sharp", "✦  Sharp", "Native resolution · crispest, needs bandwidth",
+         {"target_w": 0, "quality": 92, "fps": 60, "sharp": True}),
+    ]
+
     def _start_control(self):
         if not PEER or not SECRET:
             self.home_status.configure(text="⚠  Not set up yet — run the Setup Wizard.")
             return
-        self.client = ClientBackend(PEER, self.client_events)
+        self._open_connect_chooser()
+
+    def _open_connect_chooser(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Start session")
+        win.geometry("440x360")
+        win.configure(fg_color=BG)
+        win.transient(self)
+        win.after(200, lambda: (win.lift(), win.focus_force(), win.grab_set()))
+        try:
+            win.iconbitmap(ICON)
+        except Exception:
+            pass
+        ctk.CTkLabel(win, text="Pick quality for this session", text_color=TEXT,
+                     font=ctk.CTkFont(FONT_UI, 18, weight="bold")).pack(pady=(22, 2))
+        ctk.CTkLabel(win, text=f"Controlling {PEER}", text_color=MUTED,
+                     font=ctk.CTkFont(FONT_UI, 12)).pack(pady=(0, 14))
+        last = self.settings.get("conn_preset", "balanced")
+
+        def choose(key, prefs):
+            self.settings["conn_preset"] = key
+            save_settings(self.settings)
+            win.destroy()
+            self._begin_control(prefs)
+
+        for key, title, desc, prefs in self.CONN_PRESETS:
+            hot = (key == last)
+            b = ctk.CTkFrame(win, corner_radius=12, fg_color=SURF_HOVER if hot else CARD,
+                             border_width=1, border_color=ACCENT if hot else BORDER)
+            b.pack(fill="x", padx=22, pady=6)
+            inner = ctk.CTkButton(b, text="", fg_color="transparent", hover_color=SURF_HOVER,
+                                  corner_radius=12, height=58,
+                                  command=lambda k=key, p=prefs: choose(k, p))
+            inner.pack(fill="both", expand=True)
+            txt = ctk.CTkFrame(inner, fg_color="transparent")
+            txt.place(relx=0.04, rely=0.5, anchor="w")
+            ctk.CTkLabel(txt, text=title, text_color=(ACCENT if hot else TEXT),
+                         font=ctk.CTkFont(FONT_UI, 15, weight="bold")).pack(anchor="w")
+            ctk.CTkLabel(txt, text=desc, text_color=TEXT_BODY,
+                         font=ctk.CTkFont(FONT_UI, 11)).pack(anchor="w")
+
+    def _begin_control(self, prefs):
+        self.client = ClientBackend(PEER, self.client_events, prefs=prefs)
         self.client.start()
         self._decoded = None
         self._decoded_counter = self._drawn_counter = 0
@@ -1178,17 +1250,26 @@ class RemoteDesktopApp(ctk.CTk):
         if not (self.client_paired and not self.paused):
             return
         if self.game_mode:
-            cx = self.canvas.winfo_width() // 2
-            cy = self.canvas.winfo_height() // 2
-            dx, dy = e.x - cx, e.y - cy
-            if dx == 0 and dy == 0:
-                return                       # our own warp-to-center event; ignore
-            self._pending_rmove[0] += dx
-            self._pending_rmove[1] += dy
-            try:                             # snap the pointer back so the trackpad never runs out
-                self.canvas.event_generate("<Motion>", warp=True, x=cx, y=cy)
-            except Exception:
-                pass
+            # Measure movement as the delta between successive positions (works the
+            # same for a mouse or a trackpad), and only re-center the pointer when it
+            # nears an edge — warping on every event fights a high-rate mouse and jitters.
+            x, y = e.x, e.y
+            if self._lock_last is not None:
+                dx, dy = x - self._lock_last[0], y - self._lock_last[1]
+                if dx or dy:
+                    self._pending_rmove[0] += dx
+                    self._pending_rmove[1] += dy
+            self._lock_last = (x, y)
+            w = max(self.canvas.winfo_width(), 2)
+            h = max(self.canvas.winfo_height(), 2)
+            margin = 80
+            if x < margin or y < margin or x > w - margin or y > h - margin:
+                cx, cy = w // 2, h // 2
+                self._lock_last = (cx, cy)
+                try:
+                    self.canvas.event_generate("<Motion>", warp=True, x=cx, y=cy)
+                except Exception:
+                    pass
         else:
             rel = self._rel(e.x, e.y)
             if rel:
@@ -1248,6 +1329,7 @@ class RemoteDesktopApp(ctk.CTk):
     def _toggle_game(self):
         self.game_mode = not self.game_mode
         self._pending_rmove = [0, 0]
+        self._lock_last = None
         if self.game_mode:
             self.game_btn.configure(text="🎮 Mouse-look: ON  (F8)", fg_color=ACCENT,
                                     text_color=ON_ACCENT, border_color=ACCENT, hover_color=ACCENT_HOVER)
@@ -1263,6 +1345,7 @@ class RemoteDesktopApp(ctk.CTk):
     def _recenter_pointer(self):
         cx = max(self.canvas.winfo_width() // 2, 1)
         cy = max(self.canvas.winfo_height() // 2, 1)
+        self._lock_last = (cx, cy)
         try:
             self.canvas.event_generate("<Motion>", warp=True, x=cx, y=cy)
         except Exception:
