@@ -600,11 +600,16 @@ class HostBackend:
             replaced = self._session is not my_stop     # a newer session took over
             if not replaced:
                 self._session = None
-            # If WE turned sharing off, tell the controller before the socket closes.
-            if self._async_stop.is_set():
+            # If THIS PC ended the session (turned sharing off, or pressed Disconnect),
+            # tell the controller so it shows a message and stops — instead of a silent
+            # drop (and a possible auto-reconnect). Not on takeover / controller leaving.
+            turned_off = self._async_stop.is_set()
+            kicked = my_stop.is_set() and not replaced and not turned_off
+            if turned_off or kicked:
+                reason = (f"Oops — it looks like {NAME} turned off remote control."
+                          if turned_off else f"{NAME} disconnected you.")
                 try:
-                    await ws.send(json.dumps({"type": "bye",
-                        "reason": f"{NAME} stopped allowing remote control."}))
+                    await ws.send(json.dumps({"type": "bye", "reason": reason}))
                 except Exception:
                     pass
             try:
