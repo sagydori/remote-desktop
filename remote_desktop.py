@@ -40,13 +40,13 @@ SECRET = getattr(config, "SECRET", "")
 HERE = os.path.dirname(os.path.abspath(__file__))
 ICON = os.path.join(HERE, "icon.ico")
 
-# capture / quality
-MIN_QUALITY, MIN_SCALE = 20, 0.40
-SCALE = 0.75
+# capture / quality  —  full native resolution, sharp; ease compression only under load
+MIN_QUALITY, MIN_SCALE = 60, 1.0     # never downscale (scale pinned at 1.0); quality floor 60
+SCALE = 1.0
 DIFF_THRESHOLD = 1.2
 KEYFRAME_EVERY = 2.0
 USE_BETTERCAM = True
-DEFAULT_QUALITY = 55
+DEFAULT_QUALITY = 85
 DEFAULT_FPS = 30
 
 # palette
@@ -457,7 +457,7 @@ class RemoteDesktopApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
         self.title("Remote Desktop")
-        self.geometry("1040x680")
+        self.geometry("1280x820")
         self.minsize(820, 560)
         self.configure(fg_color=BG)
         try:
@@ -727,7 +727,8 @@ class RemoteDesktopApp(ctk.CTk):
         scale = min(cw / fw, ch / fh)
         dw, dh = max(int(fw * scale), 1), max(int(fh * scale), 1)
         if (dw, dh) != (fw, fh):
-            arr = cv2.resize(arr, (dw, dh), interpolation=cv2.INTER_LINEAR)
+            interp = cv2.INTER_AREA if dw < fw else cv2.INTER_CUBIC   # sharp both ways
+            arr = cv2.resize(arr, (dw, dh), interpolation=interp)
         ox, oy = (cw - dw) // 2, (ch - dh) // 2
         self.video_rect = (ox, oy, dw, dh)
         self._photo = ImageTk.PhotoImage(Image.fromarray(arr))
