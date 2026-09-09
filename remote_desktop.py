@@ -1,18 +1,19 @@
 """
 remote_desktop.py  —  The one app, on both PCs.
 
-It does BOTH jobs at once:
-  * Always shares THIS PC in the background, so your other PC can control it.
-  * Has a "Control my other PC" button to view + control the other PC.
+Two clear buttons:
+  * "Control <other PC>"  — view + control the other computer.
+  * "Allow this PC to be controlled" — turn on so the other PC can control this one.
 
-So either computer can control the other — same app, one window, one shortcut.
-Settings (this PC's name, the other PC's name, the shared password) come from
-config.py, which the Setup Wizard writes. Connections travel over Tailscale.
+Same app on both PCs, so either can control the other. Settings (this PC's
+name, the other PC's name, the shared password) come from config.py, written
+by the Setup Wizard. Connections travel over Tailscale.
 """
 
 import asyncio
 import concurrent.futures
 import json
+import os
 import queue
 import threading
 import time
@@ -35,6 +36,9 @@ NAME = getattr(config, "NAME", "") or "this PC"
 PEER = getattr(config, "PEER", "") or getattr(config, "HOST", "")
 PORT = getattr(config, "PORT", 8765)
 SECRET = getattr(config, "SECRET", "")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ICON = os.path.join(HERE, "icon.ico")
 
 # capture / quality
 MIN_QUALITY, MIN_SCALE = 20, 0.40
@@ -220,7 +224,7 @@ class Capture:
 
 
 # ===========================================================================
-#  HOST side: always-on server so the OTHER PC can control this one
+#  HOST side: server so the OTHER PC can control this one
 # ===========================================================================
 class HostBackend:
     def __init__(self, events, monitor_index=1, quality=DEFAULT_QUALITY, fps=DEFAULT_FPS):
@@ -454,13 +458,24 @@ class RemoteDesktopApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
         self.title("Remote Desktop")
         self.geometry("1040x680")
-        self.minsize(760, 500)
+        self.minsize(820, 560)
         self.configure(fg_color=BG)
+        try:
+            self.iconbitmap(ICON)
+        except Exception:
+            pass
+        self._icon_img = None
+        try:
+            self._icon_img = ctk.CTkImage(Image.open(ICON), size=(30, 30))
+        except Exception:
+            pass
 
         self.host_events = queue.Queue()
         self.client_events = queue.Queue()
         self.client = None
-        self.host_state = "starting"
+        self.host = None
+        self.sharing = False
+        self.host_state = "off"
         self.client_paired = False
         self.paused = False
         self.fullscreen = False
@@ -477,43 +492,97 @@ class RemoteDesktopApp(ctk.CTk):
         self._build_session()
         self._show_home()
 
-        # Always share this PC in the background.
-        self.host = HostBackend(self.host_events)
-        self.host.start()
-
         self.bind("<F11>", lambda e: self._toggle_fullscreen())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(80, self._poll)
+        self.after(400, self._reassert_icon)   # CTk can reset the icon after init
+
+    def _reassert_icon(self):
+        try:
+            self.iconbitmap(ICON)
+        except Exception:
+            pass
 
     # ---- home page -------------------------------------------------------
     def _build_home(self):
         self.home = ctk.CTkFrame(self, fg_color=BG)
-        card = ctk.CTkFrame(self.home, corner_radius=20, fg_color=CARD)
-        card.place(relx=0.5, rely=0.5, anchor="center")
 
-        ctk.CTkLabel(card, text="Remote Desktop",
-                     font=ctk.CTkFont(size=34, weight="bold")).pack(padx=70, pady=(40, 2))
-        ctk.CTkLabel(card, text=f"This PC:  {NAME}", text_color=MUTED,
-                     font=ctk.CTkFont(size=14)).pack()
+        header = ctk.CTkFrame(self.home, fg_color="transparent")
+        header.pack(fill="x", padx=28, pady=(20, 0))
+        if self._icon_img is not None:
+            ctk.CTkLabel(header, image=self._icon_img, text="").pack(side="left")
+        ctk.CTkLabel(header, text="  Remote Desktop",
+                     font=ctk.CTkFont(size=20, weight="bold")).pack(side="left")
+        ctk.CTkLabel(header, text=f"This PC:  {NAME}", text_color=MUTED,
+                     font=ctk.CTkFont(size=13)).pack(side="right")
 
-        # share status row
-        share = ctk.CTkFrame(card, fg_color="transparent")
-        share.pack(pady=(22, 6))
-        self.dot = ctk.CTkLabel(share, text="●", text_color="#6b7280",
-                                font=ctk.CTkFont(size=18))
+        card = ctk.CTkFrame(self.home, corner_radius=22, fg_color=CARD)
+        card.place(relx=0.5, rely=0.52, anchor="center")
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(padx=56, pady=44)
+
+        # Section 1 — control the other PC
+        ctk.CTkLabel(inner, text="CONTROL YOUR OTHER PC", text_color="#7c8698",
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(inner, text="Take over the other computer's screen.",
+                     text_color="#c7cbd4", font=ctk.CTkFont(size=13)).pack(anchor="w", pady=(2, 12))
+        self.control_btn = ctk.CTkButton(
+            inner, text=f"🖥   Control  {PEER or 'other PC'}", height=56, width=400,
+            corner_radius=12, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            font=ctk.CTkFont(size=17, weight="bold"), command=self._start_control)
+        self.control_btn.pack(fill="x")
+
+        ctk.CTkFrame(inner, height=1, fg_color="#2b2f3a").pack(fill="x", pady=24)
+
+        # Section 2 — allow this PC to be controlled
+        ctk.CTkLabel(inner, text="LET YOUR OTHER PC CONTROL THIS ONE", text_color="#7c8698",
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(inner, text="Turn on, then leave the app open, to allow access.",
+                     text_color="#c7cbd4", font=ctk.CTkFont(size=13)).pack(anchor="w", pady=(2, 12))
+        self.share_btn = ctk.CTkButton(
+            inner, text="🔓   Allow this PC to be controlled", height=56, width=400,
+            corner_radius=12, fg_color="#374151", hover_color="#2c333f",
+            font=ctk.CTkFont(size=16, weight="bold"), command=self._toggle_share)
+        self.share_btn.pack(fill="x")
+        srow = ctk.CTkFrame(inner, fg_color="transparent")
+        srow.pack(anchor="w", pady=(12, 0))
+        self.dot = ctk.CTkLabel(srow, text="●", text_color="#6b7280", font=ctk.CTkFont(size=16))
         self.dot.pack(side="left", padx=(0, 8))
-        self.share_label = ctk.CTkLabel(share, text="Starting...", text_color="#c7cbd4",
-                                        font=ctk.CTkFont(size=15))
+        self.share_label = ctk.CTkLabel(srow, text="Off — not shareable", text_color=MUTED,
+                                        font=ctk.CTkFont(size=13))
         self.share_label.pack(side="left")
 
-        # control button
-        self.control_btn = ctk.CTkButton(
-            card, text=f"Control  {PEER or 'my other PC'}   →", height=56, width=320,
-            corner_radius=14, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-            font=ctk.CTkFont(size=18, weight="bold"), command=self._start_control)
-        self.control_btn.pack(padx=70, pady=(20, 8))
-        self.home_status = ctk.CTkLabel(card, text="", text_color=MUTED)
-        self.home_status.pack(pady=(0, 36))
+        self.home_status = ctk.CTkLabel(inner, text="", text_color="#f59e0b",
+                                        font=ctk.CTkFont(size=13), wraplength=400, justify="left")
+        self.home_status.pack(anchor="w", pady=(16, 0))
+
+        if not PEER or not SECRET:
+            self.control_btn.configure(state="disabled", text="🖥   Run Setup first")
+            self.home_status.configure(text="⚠  Not set up yet — run the Setup Wizard (INSTALL.bat).")
+        elif NAME and NAME != "this PC" and PEER.strip().lower() == NAME.strip().lower():
+            self.home_status.configure(
+                text="⚠  The other-PC name is the same as this PC. Re-run Setup and enter the "
+                     "OTHER computer's Tailscale name.")
+
+    # ---- share (host) toggle --------------------------------------------
+    def _toggle_share(self):
+        self._stop_share() if self.host is not None else self._start_share()
+
+    def _start_share(self):
+        self.host = HostBackend(self.host_events)
+        self.host.start()
+        self.sharing = True
+        self.share_btn.configure(text="🔒   Stop allowing control", fg_color=RED,
+                                 hover_color="#991b1b")
+
+    def _stop_share(self):
+        if self.host:
+            self.host.stop()
+            self.host = None
+        self.sharing = False
+        self.share_btn.configure(text="🔓   Allow this PC to be controlled",
+                                 fg_color="#374151", hover_color="#2c333f")
+        self._apply_host_state("off")
 
     # ---- session page ----------------------------------------------------
     def _build_session(self):
@@ -681,13 +750,13 @@ class RemoteDesktopApp(ctk.CTk):
         self.host_state = state
         if state == "ready":
             self.dot.configure(text_color=GREEN)
-            self.share_label.configure(text=f"Ready — {PEER or 'your other PC'} can connect")
+            self.share_label.configure(text="On — your other PC can connect")
         elif state == "controlled":
             self.dot.configure(text_color=ACCENT)
             self.share_label.configure(text="Your other PC is controlling this one now")
         else:
             self.dot.configure(text_color="#6b7280")
-            self.share_label.configure(text="Not sharing")
+            self.share_label.configure(text="Off — not shareable")
 
     def _poll(self):
         try:
@@ -695,7 +764,6 @@ class RemoteDesktopApp(ctk.CTk):
                 m = self.host_events.get_nowait()
                 if m[0] == "host":
                     self._apply_host_state(m[1])
-                # 'log' messages are ignored in the GUI (kept minimal)
         except queue.Empty:
             pass
         try:
@@ -731,7 +799,7 @@ def main():
     try:
         import updater
         if updater.check_and_update():
-            return   # relaunched with new version
+            return
     except Exception:
         pass
     RemoteDesktopApp().mainloop()

@@ -101,11 +101,13 @@ def _psq(s):
 
 def make_shortcut(name, script):
     target, args = pythonw_path(), f'"{os.path.join(HERE, script)}"'
+    icon = os.path.join(HERE, "icon.ico")
+    icon_loc = icon if os.path.exists(icon) else target
     ps = ("$d=[Environment]::GetFolderPath('Desktop');"
           f"$p=Join-Path $d '{_psq(name)}.lnk';"
           "$w=New-Object -ComObject WScript.Shell;$s=$w.CreateShortcut($p);"
           f"$s.TargetPath='{_psq(target)}';$s.Arguments='{_psq(args)}';"
-          f"$s.WorkingDirectory='{_psq(HERE)}';$s.IconLocation='{_psq(target)}';"
+          f"$s.WorkingDirectory='{_psq(HERE)}';$s.IconLocation='{_psq(icon_loc)}';"
           "$s.Save();Write-Output $p")
     code, out, _ = _run(["powershell", "-NoProfile", "-Command", ps], timeout=20)
     return out.strip().splitlines()[-1] if code == 0 and out else None
@@ -120,6 +122,10 @@ class Wizard(ctk.CTk):
         self.geometry("660x580")
         self.minsize(620, 540)
         self.configure(fg_color=BG)
+        try:
+            self.iconbitmap(os.path.join(HERE, "icon.ico"))
+        except Exception:
+            pass
 
         self.jobs = queue.Queue()
         name, peer, port, secret = read_config()
