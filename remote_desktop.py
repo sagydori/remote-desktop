@@ -81,9 +81,34 @@ if os.name == "nt":
         mi = _MOUSEINPUT(int(dx), int(dy), 0, _MOUSEEVENTF_MOVE, 0, ctypes.pointer(extra))
         inp = _INPUT(0, _INPUTUNION(mi))
         ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
+    class _POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    class _CURSORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                    ("hCursor", ctypes.c_void_p), ("ptScreenPos", _POINT)]
+
+    _CURSOR_SHOWING = 0x00000001
+
+    def cursor_screen_pos():
+        """Screen (x, y) of the mouse cursor if it is currently VISIBLE, else None.
+        Games hide the cursor during play (returns None) and show it in menus/
+        inventories (returns the position) — exactly when the controller needs it."""
+        ci = _CURSORINFO()
+        ci.cbSize = ctypes.sizeof(_CURSORINFO)
+        try:
+            if ctypes.windll.user32.GetCursorInfo(ctypes.byref(ci)) and (ci.flags & _CURSOR_SHOWING):
+                return ci.ptScreenPos.x, ci.ptScreenPos.y
+        except Exception:
+            pass
+        return None
 else:
     def _move_relative(dx, dy):
         pass  # patched to pynput's relative move per-controller on non-Windows
+
+    def cursor_screen_pos():
+        return None
 
 # capture / quality
 MIN_QUALITY = 60                      # quality floor when shedding load
@@ -315,6 +340,20 @@ def monitor_geometry(monitor_index):
     return m["left"], m["top"], m["width"], m["height"]
 
 
+# A classic arrow cursor drawn into the frame (the capture APIs don't include it).
+_CURSOR_POLY = np.array([[0, 0], [0, 16], [4, 12], [7, 19], [10, 18], [6, 11], [11, 11]], np.int32)
+
+
+def _draw_cursor(img, x, y):
+    h, w = img.shape[:2]
+    if not (-12 <= x < w and -12 <= y < h):
+        return
+    pts = _CURSOR_POLY + (int(x), int(y))
+    cv2.polylines(img, [pts], True, (0, 0, 0), 3, cv2.LINE_AA)     # dark halo
+    cv2.fillPoly(img, [pts], (255, 255, 255), cv2.LINE_AA)         # white body
+    cv2.polylines(img, [pts], True, (0, 0, 0), 1, cv2.LINE_AA)     # crisp edge
+
+
 class ScreenGrabber:
     """bettercam (Desktop Duplication, captures games) with mss fallback. One thread only."""
     def __init__(self, monitor_index, target_fps=60):
@@ -324,6 +363,10 @@ class ScreenGrabber:
         self._prev = None
         self._last_full = None
         self._started = False
+        try:
+            self.left, self.top = monitor_geometry(monitor_index)[:2]
+        except Exception:
+            self.left, self.top = 0, 0
         if USE_BETTERCAM:
             try:
                 import bettercam
@@ -363,6 +406,13 @@ class ScreenGrabber:
             self._prev = sig
         if scale != 1.0:
             bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        # Draw the OS cursor into the frame when it's visible (menus, chests, desktop)
+        # so the controller can see and click it. Hidden during game-play automatically.
+        cur = cursor_screen_pos()
+        if cur is not None:
+            if scale == 1.0:
+                bgr = bgr.copy()                  # don't scribble on the capture buffer
+            _draw_cursor(bgr, (cur[0] - self.left) * scale, (cur[1] - self.top) * scale)
         params = [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
         if hasattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR"):
             h, w = bgr.shape[:2]
