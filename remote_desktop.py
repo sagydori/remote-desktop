@@ -297,12 +297,12 @@ class AdaptiveEncoder:
 
     def note_frame_time(self, dt, interval):
         self._ema = 0.6 * self._ema + 0.4 * dt
-        if self._ema > interval * 0.9:          # behind -> lighten the load
+        if self._ema > interval * 0.8:          # behind -> lighten load early (keeps latency low)
             if self.scale > self.min_scale:
                 self.scale = round(max(self.min_scale, self.scale - 0.1), 2)
             elif self.quality > MIN_QUALITY:
                 self.quality = max(MIN_QUALITY, self.quality - 4)
-        elif self._ema < interval * 0.5:        # headroom -> improve again
+        elif self._ema < interval * 0.45:       # headroom -> improve again
             if self.quality < self.max_quality:
                 self.quality = min(self.max_quality, self.quality + 3)
             elif self.scale < self.max_scale:
@@ -1258,60 +1258,66 @@ class RemoteDesktopApp(ctk.CTk):
         self._open_connect_chooser()
 
     def _open_connect_chooser(self):
-        win = ctk.CTkToplevel(self)
-        win.title("Start session")
-        # Size for the current interface scaling and center on the window, so the
-        # content is never clipped ("cut in half").
-        try:
-            sc = float(ctk.ScalingTracker.get_widget_scaling(self))
-        except Exception:
-            sc = 1.0
-        w, h = int(460 * sc), int(470 * sc)
-        px = self.winfo_rootx() + max((self.winfo_width() - w) // 2, 0)
-        py = self.winfo_rooty() + max((self.winfo_height() - h) // 2, 0)
-        win.geometry(f"{w}x{h}+{px}+{py}")
-        win.resizable(False, False)
-        win.configure(fg_color=BG)
-        win.transient(self)
-        win.after(200, lambda: (win.lift(), win.focus_force(), win.grab_set()))
-        try:
-            win.iconbitmap(ICON)
-        except Exception:
-            pass
-        ctk.CTkLabel(win, text="Pick quality for this session", text_color=TEXT,
-                     font=ctk.CTkFont(FONT_UI, 18, weight="bold")).pack(pady=(22, 2))
-        ctk.CTkLabel(win, text=f"Controlling {PEER}", text_color=MUTED,
-                     font=ctk.CTkFont(FONT_UI, 12)).pack(pady=(0, 14))
+        # Built as a full-window in-app page (not a separate window) so it can
+        # never be clipped by display scaling.
+        if getattr(self, "_chooser", None) is not None:
+            try: self._chooser.destroy()
+            except Exception: pass
+        ov = ctk.CTkFrame(self, fg_color=BG)
+        ov.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._chooser = ov
+
+        card = ctk.CTkFrame(ov, corner_radius=18, fg_color=CARD,
+                            border_width=1, border_color=BORDER)
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        self._corner_brackets(card, color=ACCENT_DIM)
+        pad = ctk.CTkFrame(card, fg_color="transparent")
+        pad.pack(padx=40, pady=32)
+
+        ctk.CTkLabel(pad, text="Pick quality for this session", text_color=TEXT,
+                     font=ctk.CTkFont(FONT_UI, 19, weight="bold")).pack(anchor="w")
+        self._accent_underline(pad, width=52, height=2).pack(anchor="w", pady=(3, 2))
+        ctk.CTkLabel(pad, text=f"Controlling {PEER}", text_color=MUTED,
+                     font=ctk.CTkFont(FONT_UI, 12)).pack(anchor="w", pady=(0, 16))
+
         last = self.settings.get("conn_preset", "balanced")
+
+        def close_chooser():
+            try: ov.destroy()
+            except Exception: pass
+            self._chooser = None
 
         def choose(key, prefs):
             self.settings["conn_preset"] = key
             save_settings(self.settings)
-            win.destroy()
+            close_chooser()
             self._begin_control(prefs)
 
         for key, title, desc, prefs in self.CONN_PRESETS:
             hot = (key == last)
-            # Button base = the whole area is clickable via its command; the two
-            # overlaid labels are ALSO bound, so clicking the text works too.
-            row = ctk.CTkButton(win, text="", height=64, corner_radius=12,
-                                fg_color=SURF_HOVER if hot else CARD,
+            row = ctk.CTkButton(pad, text="", width=380, height=66, corner_radius=12,
+                                fg_color=SURF_HOVER if hot else SURF_INSET,
                                 hover_color=SURF_HOVER, border_width=1,
                                 border_color=ACCENT if hot else BORDER,
                                 command=lambda k=key, p=prefs: choose(k, p))
-            row.pack(fill="x", padx=22, pady=6)
+            row.pack(fill="x", pady=6)
             t = ctk.CTkLabel(row, text=title, text_color=(ACCENT if hot else TEXT),
                              font=ctk.CTkFont(FONT_UI, 15, weight="bold"))
-            t.place(x=18, y=12)
+            t.place(x=20, y=13)
             d = ctk.CTkLabel(row, text=desc, text_color=TEXT_BODY,
                              font=ctk.CTkFont(FONT_UI, 11))
-            d.place(x=18, y=36)
+            d.place(x=20, y=38)
             for lbl in (t, d):
                 lbl.bind("<Button-1>", lambda _e, k=key, p=prefs: choose(k, p))
-                try:
-                    lbl.configure(cursor="hand2")
-                except Exception:
-                    pass
+                try: lbl.configure(cursor="hand2")
+                except Exception: pass
+
+        ctk.CTkButton(pad, text="Cancel", width=380, height=34, corner_radius=17,
+                      fg_color="transparent", border_width=1, border_color=BORDER,
+                      hover_color=SURF_HOVER, text_color=TEXT_BODY,
+                      command=close_chooser).pack(fill="x", pady=(12, 0))
+        ov.bind("<Escape>", lambda _e: close_chooser())
+        ov.focus_set()
 
     def _begin_control(self, prefs):
         self.client = ClientBackend(PEER, self.client_events, prefs=prefs)
@@ -1323,7 +1329,7 @@ class RemoteDesktopApp(ctk.CTk):
         self._decode_thread.start()
         self._show_session()
         self._set_message(f"Connecting to {PEER} ...")
-        self.after(16, self._render_loop)
+        self.after(10, self._render_loop)
 
     def _stop_control(self):
         self._decoding = False
@@ -1435,8 +1441,8 @@ class RemoteDesktopApp(ctk.CTk):
         if self.game_mode:
             self.game_btn.configure(text="🎮 Mouse-look: ON  (F8)", fg_color=ACCENT,
                                     text_color=ON_ACCENT, border_color=ACCENT, hover_color=ACCENT_HOVER)
-            # show a crosshair reticle at the locked center instead of hiding the cursor
-            self.canvas.configure(cursor="crosshair")
+            # hide the local cursor while locked — in-game there is no cursor to show
+            self.canvas.configure(cursor="none")
             self.canvas.focus_set()
             self._recenter_pointer()
         else:
@@ -1515,7 +1521,7 @@ class RemoteDesktopApp(ctk.CTk):
             self._draw(self._decoded)
         elif not self.client_paired:
             self._set_message(f"Connecting to {PEER} ...  (is the app open on that PC?)")
-        self.after(16, self._render_loop)
+        self.after(10, self._render_loop)
 
     def _draw(self, decoded):
         # Runs on the UI thread: only the cheap blit of an already-decoded frame.
