@@ -16,8 +16,7 @@ import sys
 import urllib.request
 import zipfile
 
-# Set to "youruser/yourrepo" once the GitHub repo is created (wizard/installer step).
-REPO = "REPLACE_WITH/GITHUB_REPO"
+REPO = "sagydori/remote-desktop"
 BRANCH = "main"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
