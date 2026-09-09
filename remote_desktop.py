@@ -25,7 +25,7 @@ import mss
 import numpy as np
 import customtkinter as ctk
 from PIL import Image, ImageTk
-from pynput.keyboard import Controller as KeyboardController, Key
+from pynput.keyboard import Controller as KeyboardController, Key, KeyCode
 from pynput.mouse import Button, Controller as MouseController
 import websockets
 
@@ -286,7 +286,17 @@ class InputController:
                 self.mouse.position = self._abs(e["x"], e["y"])
             self.mouse.scroll(e.get("dx", 0), e.get("dy", 0))
         elif t == "key":
-            key = getattr(Key, e["key"], None) if e.get("special") else e.get("key")
+            if e.get("special"):
+                key = getattr(Key, e["key"], None)
+            elif e.get("vk") is not None:
+                # Physical key by virtual-key code: lets Shift/Ctrl/Alt compose
+                # naturally and keeps game movement keys working while modifiers held.
+                try:
+                    key = KeyCode.from_vk(int(e["vk"]))
+                except Exception:
+                    key = None
+            else:
+                key = e.get("key")
             if key is None:
                 return
             try:
@@ -296,6 +306,8 @@ class InputController:
                     self.keyboard.release(key); self._keys.discard(key)
             except Exception:
                 pass
+        elif t == "release_all":
+            self.release_all()
 
     def release_all(self):
         for k in list(self._keys):
@@ -408,7 +420,9 @@ class ScreenGrabber:
                 return None
             self._prev = sig
         if scale != 1.0:
-            bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            # INTER_LINEAR is much faster than INTER_AREA for downscaling and looks
+            # nearly identical on live video — more fps / less delay.
+            bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
         # Draw the OS cursor into the frame when it's visible (menus, chests, desktop)
         # so the controller can see and click it. Hidden during game-play automatically.
         cur = cursor_screen_pos()
@@ -1288,6 +1302,9 @@ class RemoteDesktopApp(ctk.CTk):
         c.bind("<KeyPress>", lambda e: self._on_key(e, "press"))
         c.bind("<KeyRelease>", lambda e: self._on_key(e, "release"))
         c.bind("<Enter>", lambda e: c.focus_set())
+        # If focus leaves (alt-tab), release every held key on the host so nothing
+        # gets "stuck down" (e.g. Shift staying pressed and blocking movement).
+        c.bind("<FocusOut>", lambda e: self._release_all_remote())
 
     def _show_home(self):
         self.session.pack_forget()
@@ -1420,14 +1437,17 @@ class RemoteDesktopApp(ctk.CTk):
             # same for a mouse or a trackpad), and only re-center the pointer when it
             # nears an edge — warping on every event fights a high-rate mouse and jitters.
             x, y = e.x, e.y
+            w = max(self.canvas.winfo_width(), 2)
+            h = max(self.canvas.winfo_height(), 2)
             if self._lock_last is not None:
                 dx, dy = x - self._lock_last[0], y - self._lock_last[1]
-                if dx or dy:
+                # Ignore huge deltas: those come from events queued BEFORE a
+                # re-center warp took effect (measuring old pos vs new center) and
+                # would show up in-game as a sudden camera jump.
+                if (dx or dy) and abs(dx) < w * 0.5 and abs(dy) < h * 0.5:
                     self._pending_rmove[0] += dx
                     self._pending_rmove[1] += dy
             self._lock_last = (x, y)
-            w = max(self.canvas.winfo_width(), 2)
-            h = max(self.canvas.winfo_height(), 2)
             margin = 80
             if x < margin or y < margin or x > w - margin or y > h - margin:
                 cx, cy = w // 2, h // 2
@@ -1476,11 +1496,17 @@ class RemoteDesktopApp(ctk.CTk):
         if self.client_paired and not self.paused:
             if e.keysym in _SPECIAL:
                 self.client.send({"type": "key", "action": action, "key": _SPECIAL[e.keysym], "special": True})
+            elif e.keycode:
+                # send the physical key (virtual-key code) so Shift/Ctrl/Alt compose
+                # correctly and game movement keeps working while a modifier is held
+                self.client.send({"type": "key", "action": action, "vk": int(e.keycode)})
             elif e.char and e.char.isprintable():
                 self.client.send({"type": "key", "action": action, "key": e.char, "special": False})
-            elif len(e.keysym) == 1:
-                self.client.send({"type": "key", "action": action, "key": e.keysym, "special": False})
         return "break"
+
+    def _release_all_remote(self):
+        if self.client_paired:
+            self.client.send({"type": "release_all"})
 
     def _toggle_pause(self):
         self.paused = not self.paused
