@@ -317,19 +317,29 @@ def monitor_geometry(monitor_index):
 
 class ScreenGrabber:
     """bettercam (Desktop Duplication, captures games) with mss fallback. One thread only."""
-    def __init__(self, monitor_index):
+    def __init__(self, monitor_index, target_fps=60):
         self.backend = "mss"
         self.cam = None
         self._sct = None
         self._prev = None
         self._last_full = None
+        self._started = False
         if USE_BETTERCAM:
             try:
                 import bettercam
                 self.cam = bettercam.create(output_idx=max(0, monitor_index - 1), output_color="BGR")
-                self.cam.grab()
+                # Continuous capture — far faster than a one-shot grab() per frame
+                # (grab() has heavy per-call overhead that caps you near ~20 fps).
+                # video_mode keeps a steady supply (repeats the last frame if static).
+                self.cam.start(target_fps=int(target_fps), video_mode=True)
+                self._started = True
                 self.backend = "bettercam"
             except Exception:
+                try:
+                    if self.cam is not None:
+                        self.cam.release()
+                except Exception:
+                    pass
                 self.cam = None
         if self.cam is None:
             self._sct = mss.mss()
@@ -337,12 +347,11 @@ class ScreenGrabber:
 
     def grab_jpeg(self, quality, scale, force):
         if self.cam is not None:
-            frame = self.cam.grab()
+            frame = self.cam.get_latest_frame()
             if frame is None:
-                if force and self._last_full is not None:
-                    frame = self._last_full
-                else:
+                if self._last_full is None:
                     return None
+                frame = self._last_full
             else:
                 self._last_full = frame
             bgr = frame
@@ -367,7 +376,10 @@ class ScreenGrabber:
 
     def close(self):
         try:
-            if self.cam is not None: self.cam.release()
+            if self.cam is not None:
+                if self._started:
+                    self.cam.stop()
+                self.cam.release()
         except Exception: pass
         try:
             if self._sct is not None: self._sct.close()
@@ -1248,7 +1260,17 @@ class RemoteDesktopApp(ctk.CTk):
     def _open_connect_chooser(self):
         win = ctk.CTkToplevel(self)
         win.title("Start session")
-        win.geometry("440x360")
+        # Size for the current interface scaling and center on the window, so the
+        # content is never clipped ("cut in half").
+        try:
+            sc = float(ctk.ScalingTracker.get_widget_scaling(self))
+        except Exception:
+            sc = 1.0
+        w, h = int(460 * sc), int(470 * sc)
+        px = self.winfo_rootx() + max((self.winfo_width() - w) // 2, 0)
+        py = self.winfo_rooty() + max((self.winfo_height() - h) // 2, 0)
+        win.geometry(f"{w}x{h}+{px}+{py}")
+        win.resizable(False, False)
         win.configure(fg_color=BG)
         win.transient(self)
         win.after(200, lambda: (win.lift(), win.focus_force(), win.grab_set()))
