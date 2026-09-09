@@ -79,13 +79,16 @@ else:
     def _move_relative(dx, dy):
         pass  # patched to pynput's relative move per-controller on non-Windows
 
-# capture / quality  —  full native resolution, sharp; ease compression only under load
-MIN_QUALITY, MIN_SCALE = 72, 1.0     # never downscale (scale pinned at 1.0); quality floor 72 (stay sharp)
-SCALE = 1.0
+# capture / quality
+MIN_QUALITY = 60                      # quality floor when shedding load
+SCALE = 1.0                           # capture at native resolution (ceiling)
+SMOOTH_MIN_SCALE = 0.5                # "Smoothest": may drop to half-res to hold the frame rate
+SHARP_MIN_SCALE = 1.0                 # "Sharpest": never downscale (fps may suffer on big screens)
+BIG_FRAME_PIXELS = 2_100_000          # above ~1080p, use faster 4:2:0 chroma instead of 4:4:4
 DIFF_THRESHOLD = 1.2
 KEYFRAME_EVERY = 2.0
 USE_BETTERCAM = True
-DEFAULT_QUALITY = 92                  # high quality; edges/text stay crisp
+DEFAULT_QUALITY = 90                  # high quality; edges/text stay crisp
 DEFAULT_FPS = 60                      # smooth 60 fps
 
 # palette
@@ -116,6 +119,7 @@ DEFAULT_SETTINGS = {
     "theme": "blue",            # blue | green | dark-blue
     "fps": DEFAULT_FPS,         # streaming frame rate when this PC is shared
     "quality": DEFAULT_QUALITY, # streaming JPEG quality when this PC is shared
+    "priority": "smooth",       # smooth (hold fps, may drop resolution) | sharp (lock full res)
     "sensitivity": 1.0,         # mouse-look turn speed multiplier
     "ui_scale": 1.0,            # overall GUI size (widget scaling)
 }
@@ -203,24 +207,29 @@ class InputController:
 
 
 class AdaptiveEncoder:
-    def __init__(self, quality):
+    """Keeps the frame rate up by shedding load when a full frame (grab + encode
+    + send) takes longer than the target interval. Resolution is dropped first
+    (the biggest win for both CPU and bandwidth), then quality."""
+
+    def __init__(self, quality, min_scale=SMOOTH_MIN_SCALE):
         self.max_quality = quality
         self.quality = quality
+        self.min_scale = min_scale
         self.scale = SCALE
         self._ema = 0.0
 
-    def note_send_time(self, dt, interval):
+    def note_frame_time(self, dt, interval):
         self._ema = 0.6 * self._ema + 0.4 * dt
-        if self._ema > interval * 0.70:
-            if self.quality > MIN_QUALITY:
-                self.quality = max(MIN_QUALITY, self.quality - 5)
-            elif self.scale > MIN_SCALE:
-                self.scale = round(max(MIN_SCALE, self.scale - 0.1), 2)
-        elif self._ema < interval * 0.25:
-            if self.scale < SCALE:
-                self.scale = round(min(SCALE, self.scale + 0.1), 2)
-            elif self.quality < self.max_quality:
-                self.quality = min(self.max_quality, self.quality + 5)
+        if self._ema > interval * 0.9:          # behind -> lighten the load
+            if self.scale > self.min_scale:
+                self.scale = round(max(self.min_scale, self.scale - 0.1), 2)
+            elif self.quality > MIN_QUALITY:
+                self.quality = max(MIN_QUALITY, self.quality - 4)
+        elif self._ema < interval * 0.5:        # headroom -> improve again
+            if self.quality < self.max_quality:
+                self.quality = min(self.max_quality, self.quality + 3)
+            elif self.scale < SCALE:
+                self.scale = round(min(SCALE, self.scale + 0.05), 2)
 
 
 def monitor_geometry(monitor_index):
@@ -269,10 +278,13 @@ class ScreenGrabber:
         if scale != 1.0:
             bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         params = [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
-        # 4:4:4 chroma: keep colored edges and text crisp instead of smeared (default is 4:2:0)
         if hasattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR"):
-            params += [int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR),
-                       int(getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x111111))]
+            h, w = bgr.shape[:2]
+            if w * h <= BIG_FRAME_PIXELS:       # ~1080p or less: 4:4:4, crisp edges/text
+                samp = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x111111)
+            else:                               # bigger: 4:2:0, far faster to encode + smaller
+                samp = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_420", 0x221111)
+            params += [int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR), int(samp)]
         ok, buf = cv2.imencode(".jpg", bgr, params)
         return buf.tobytes() if ok else None
 
@@ -313,10 +325,12 @@ class Capture:
 #  HOST side: server so the OTHER PC can control this one
 # ===========================================================================
 class HostBackend:
-    def __init__(self, events, monitor_index=1, quality=DEFAULT_QUALITY, fps=DEFAULT_FPS):
+    def __init__(self, events, monitor_index=1, quality=DEFAULT_QUALITY, fps=DEFAULT_FPS,
+                 min_scale=SMOOTH_MIN_SCALE):
         self.events = events
         self.monitor_index = monitor_index
         self.quality = quality
+        self.min_scale = min_scale
         self.interval = 1.0 / max(1, fps)
         self.loop = None
         self._async_stop = None
@@ -371,7 +385,7 @@ class HostBackend:
         self._busy = True
         self._emit("host", "controlled")
         controller = InputController(*monitor_geometry(self.monitor_index))
-        encoder = AdaptiveEncoder(self.quality)
+        encoder = AdaptiveEncoder(self.quality, min_scale=self.min_scale)
         paired = asyncio.Event(); paired.set()
         try:
             tasks = [
@@ -385,6 +399,13 @@ class HostBackend:
         finally:
             controller.release_all()
             self._busy = False
+            # If WE turned sharing off, tell the controller before the socket closes.
+            if self._async_stop.is_set():
+                try:
+                    await ws.send(json.dumps({"type": "bye",
+                        "reason": f"{NAME} stopped allowing remote control."}))
+                except Exception:
+                    pass
             self._emit("host", "ready")
 
     async def _read(self, ws, controller):
@@ -403,22 +424,35 @@ class HostBackend:
     async def _stream(self, ws, capture, encoder, paired):
         loop = asyncio.get_running_loop()
         last_key = last_stat = 0.0
-        while True:
-            await paired.wait()
-            start = loop.time()
-            force = (start - last_key) >= KEYFRAME_EVERY
-            jpeg = await capture.grab(loop, encoder.quality, encoder.scale, force)
-            if jpeg is not None:
-                t0 = loop.time()
-                await ws.send(jpeg)
-                encoder.note_send_time(loop.time() - t0, self.interval)
-                last_key = start
-            if start - last_stat >= 1.0:
-                await ws.send(json.dumps({"type": "stat", "q": encoder.quality, "scale": encoder.scale}))
-                last_stat = start
-            elapsed = loop.time() - start
-            if elapsed < self.interval:
-                await asyncio.sleep(self.interval - elapsed)
+
+        def submit(now):
+            force = (now - last_key) >= KEYFRAME_EVERY
+            return asyncio.ensure_future(capture.grab(loop, encoder.quality, encoder.scale, force))
+
+        await paired.wait()
+        pending = submit(loop.time())           # start the first grab/encode
+        try:
+            while True:
+                await paired.wait()
+                start = loop.time()
+                jpeg = await pending
+                # Kick off the NEXT grab+encode now so it runs (in its own thread)
+                # while we send the current frame — overlap is what lifts the fps.
+                pending = submit(start)
+                if jpeg is not None:
+                    await ws.send(jpeg)
+                    last_key = start
+                # React to the WHOLE frame cost (grab + encode + send), not just send.
+                encoder.note_frame_time(loop.time() - start, self.interval)
+                if start - last_stat >= 1.0:
+                    await ws.send(json.dumps({"type": "stat", "q": encoder.quality,
+                                              "scale": encoder.scale}))
+                    last_stat = start
+                elapsed = loop.time() - start
+                if elapsed < self.interval:
+                    await asyncio.sleep(self.interval - elapsed)
+        finally:
+            pending.cancel()
 
 
 # ===========================================================================
@@ -513,8 +547,16 @@ class ClientBackend:
                     self._emit("rtt", (time.time() - data["t"]) * 1000)
                 elif data.get("type") == "stat":
                     self._emit("stat", data.get("q"), data.get("scale"))
+                elif data.get("type") == "bye":
+                    # The other PC turned off "allow control" — stop cleanly, don't retry.
+                    self._emit("fatal", data.get("reason") or
+                               "The other PC stopped allowing remote control.")
+                    self._async_stop.set()
+                    return
                 elif data.get("type") == "busy":
-                    raise ConnectionError("that PC is already being controlled by someone")
+                    self._emit("fatal", "That PC is already being controlled by someone.")
+                    self._async_stop.set()
+                    return
 
     async def _send_loop(self, ws):
         while True:
@@ -667,9 +709,11 @@ class RemoteDesktopApp(ctk.CTk):
         self._stop_share() if self.host is not None else self._start_share()
 
     def _start_share(self):
+        min_scale = SHARP_MIN_SCALE if self.settings.get("priority") == "sharp" else SMOOTH_MIN_SCALE
         self.host = HostBackend(self.host_events,
                                 quality=int(self.settings.get("quality", DEFAULT_QUALITY)),
-                                fps=int(self.settings.get("fps", DEFAULT_FPS)))
+                                fps=int(self.settings.get("fps", DEFAULT_FPS)),
+                                min_scale=min_scale)
         self.host.start()
         self.sharing = True
         self.share_btn.configure(text="🔒   Stop allowing control", fg_color=RED,
@@ -766,8 +810,20 @@ class RemoteDesktopApp(ctk.CTk):
                       command=lambda v: q_lbl.configure(
                           text=f"Image quality:  {int(float(v))}")).pack(
             anchor="w", fill="x", pady=(2, 8))
+        _PRIO = {"smooth": "Smoothest — keep the frame rate (recommended)",
+                 "sharp": "Sharpest — always full resolution"}
+        _PRIO_REV = {v: k for k, v in _PRIO.items()}
+        prio_var = ctk.StringVar(value=_PRIO.get(self.settings.get("priority", "smooth"),
+                                                 _PRIO["smooth"]))
+        ctk.CTkLabel(wrap, text="On big screens (2K/4K)", font=ctk.CTkFont(size=13)).pack(
+            anchor="w", pady=(4, 0))
+        ctk.CTkOptionMenu(wrap, values=list(_PRIO.values()), variable=prio_var,
+                          width=360).pack(anchor="w", pady=(2, 8))
+
         ctk.CTkLabel(wrap, text="Higher fps / quality look better but use more bandwidth. "
-                               "Changes to streaming apply next time sharing is turned on.",
+                               "'Smoothest' briefly lowers resolution when a big screen can't keep "
+                               "up, so it stays fluid; 'Sharpest' never lowers it, so the frame "
+                               "rate may drop. Streaming changes apply next time sharing is turned on.",
                      text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=380,
                      justify="left").pack(anchor="w", pady=(2, 6))
 
@@ -782,6 +838,7 @@ class RemoteDesktopApp(ctk.CTk):
                 "sensitivity": round(float(sens_var.get()), 2),
                 "fps": int(fps_var.get()),
                 "quality": int(q_var.get()),
+                "priority": _PRIO_REV.get(prio_var.get(), "smooth"),
             })
             save_settings(self.settings)
             status.configure(text="✓ Saved.")
