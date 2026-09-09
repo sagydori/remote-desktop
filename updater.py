@@ -135,24 +135,34 @@ class _Splash:
         return f"{secs // 60}m {secs % 60:02d}s" if secs >= 60 else f"{secs}s"
 
     def on_download(self, got, total):
-        el = max(time.time() - self.start, 1e-6)
-        rate = got / el
+        el = time.time() - self.start
         mb = got / 1048576
-        if total > 0:
-            pct = min(got * 100 / total, 100)
+        if total > 0:                       # size known: show a real % + ETA
+            rate = got / max(el, 1e-6)
+            pct = min(got * 100 / total, 100) * 0.6     # download counts as first 60%
             self.bar["mode"] = "determinate"
             self.bar["value"] = pct
             remain = (total - got) / rate if rate > 0 else 0
             self.sub.config(text=f"Downloading update…  {mb:.1f} / {total / 1048576:.1f} MB")
             self.pct.config(text=f"{pct:.0f}%     about {self._eta(remain)} left")
-        else:
+        else:                               # size unknown (GitHub sends it chunked)
             self.bar["mode"] = "indeterminate"
             try:
-                self.bar.step(6)
+                self.bar.step(8)
             except Exception:
                 pass
             self.sub.config(text="Downloading update…")
-            self.pct.config(text=f"{mb:.1f} MB")
+            self.pct.config(text=f"{mb:.2f} MB   ({el:.0f}s)")
+        self._pump()
+
+    def on_install(self, done, total):
+        # Installing is the last 40% of the bar, as a real files-written percentage.
+        frac = (done / total) if total else 1.0
+        pct = 60 + 40 * min(frac, 1.0)
+        self.bar["mode"] = "determinate"
+        self.bar["value"] = pct
+        self.sub.config(text="Installing update…")
+        self.pct.config(text=f"{pct:.0f}%")
         self._pump()
 
     def message(self, text, pct=None):
@@ -199,30 +209,39 @@ def _fetch_zip(sha, timeout=90, on_progress=None):
     return buf.getvalue()
 
 
-def _apply_zip(data):
+def _apply_zip(data, on_file=None):
     zf = zipfile.ZipFile(io.BytesIO(data))
     root = zf.namelist()[0].split("/")[0] + "/"     # e.g. "remote-desktop-<sha>/"
-    for name in zf.namelist():
-        if name.endswith("/"):
-            continue
+    files = [n for n in zf.namelist()
+             if not n.endswith("/") and n[len(root):]
+             and n[len(root):] not in PRESERVE and not n[len(root):].startswith(".git")]
+    total = len(files)
+    for i, name in enumerate(files, 1):
         rel = name[len(root):]
-        if not rel or rel in PRESERVE or rel.startswith(".git"):
-            continue
         target = os.path.join(HERE, rel.replace("/", os.sep))
         os.makedirs(os.path.dirname(target) or HERE, exist_ok=True)
         with zf.open(name) as src, open(target, "wb") as out:
             shutil.copyfileobj(src, out)
+        if on_file:
+            try:
+                on_file(i, total)
+            except Exception:
+                pass
+
+
+MIN_VISIBLE = 2.2   # keep the progress window up at least this long, so it's actually seen
 
 
 def _do_update(sha, splash=None):
+    t0 = time.time()
     data = _fetch_zip(sha, on_progress=(splash.on_download if splash else None))
-    if splash:
-        splash.message("Installing…", pct=100)
-    _apply_zip(data)
+    _apply_zip(data, on_file=(splash.on_install if splash else None))
     _record_commit(sha)
     if splash:
         splash.message("Done — starting the app…", pct=100)
-        time.sleep(0.6)
+        left = MIN_VISIBLE - (time.time() - t0)
+        if left > 0:
+            time.sleep(min(left, MIN_VISIBLE))
 
 
 def check_and_update():
