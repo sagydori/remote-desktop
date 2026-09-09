@@ -1,0 +1,11 @@
+# Remote Desktop — dependencies (install on BOTH PCs)
+# Install with:  pip install -r requirements.txt
+
+websockets>=12.0       # Secure WebSocket transport to the relay
+bettercam>=1.0.0       # Fullscreen-game-capable screen capture (home PC); falls back to mss
+mss>=9.0.1             # Screen-capture fallback (home PC only, but harmless elsewhere)
+pynput>=1.7.7          # Mouse + keyboard emulation on the home PC
+opencv-python>=4.9.0   # JPEG encode/decode of frames
+numpy>=1.26.0          # Array handling for frames
+customtkinter>=5.2.0   # Modern GUI toolkit (the AnyDesk-style window)
+pillow>=10.0.0         # Image display inside the GUI

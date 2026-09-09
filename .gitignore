@@ -1,0 +1,6 @@
+# Local settings — contains your password; never publish it.
+config.py
+
+# Python cruft
+__pycache__/
+*.pyc
