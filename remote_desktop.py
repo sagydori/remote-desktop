@@ -334,7 +334,7 @@ class HostBackend:
         self.interval = 1.0 / max(1, fps)
         self.loop = None
         self._async_stop = None
-        self._busy = False
+        self._session = None            # the Event that ends the CURRENT control session
 
     def start(self):
         threading.Thread(target=self._thread_main, daemon=True).start()
@@ -360,7 +360,7 @@ class HostBackend:
         self._capture = Capture(self.monitor_index, self._emit)
         try:
             async with websockets.serve(self._handle, "0.0.0.0", PORT, max_size=None,
-                                        ping_interval=20, ping_timeout=20):
+                                        ping_interval=10, ping_timeout=10):
                 self._emit("host", "ready")
                 await self._async_stop.wait()
         except OSError as e:
@@ -380,9 +380,12 @@ class HostBackend:
     async def _handle(self, ws):
         if not await self._auth(ws):
             await ws.close(); return
-        if self._busy:
-            await ws.send(json.dumps({"type": "busy"})); await ws.close(); return
-        self._busy = True
+        # Take over any existing session instead of rejecting as "busy": a reconnect
+        # from the same user should replace a stale/zombie session, not be blocked.
+        my_stop = asyncio.Event()
+        prev, self._session = self._session, my_stop
+        if prev is not None:
+            prev.set()
         self._emit("host", "controlled")
         controller = InputController(*monitor_geometry(self.monitor_index))
         encoder = AdaptiveEncoder(self.quality, min_scale=self.min_scale)
@@ -391,6 +394,7 @@ class HostBackend:
             tasks = [
                 asyncio.create_task(self._read(ws, controller)),
                 asyncio.create_task(self._stream(ws, self._capture, encoder, paired)),
+                asyncio.create_task(my_stop.wait()),
                 asyncio.create_task(self._async_stop.wait()),
             ]
             _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -398,7 +402,9 @@ class HostBackend:
             await asyncio.gather(*pending, return_exceptions=True)
         finally:
             controller.release_all()
-            self._busy = False
+            replaced = self._session is not my_stop     # a newer session took over
+            if not replaced:
+                self._session = None
             # If WE turned sharing off, tell the controller before the socket closes.
             if self._async_stop.is_set():
                 try:
@@ -406,7 +412,12 @@ class HostBackend:
                         "reason": f"{NAME} stopped allowing remote control."}))
                 except Exception:
                     pass
-            self._emit("host", "ready")
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            if not replaced:                             # newer session already shows "controlled"
+                self._emit("host", "ready")
 
     async def _read(self, ws, controller):
         async for msg in ws:
@@ -625,6 +636,14 @@ class RemoteDesktopApp(ctk.CTk):
         self._bytes = deque(maxlen=120)
         self.rtt = None
         self.q = self.scale = None
+        # client video decode runs on its own thread so heavy 4K decode/resize
+        # never blocks the UI (that was capping the displayed frame rate).
+        self._decode_thread = None
+        self._decoding = False
+        self._decoded = None            # (rgb_array, ox, oy, dw, dh, nbytes)
+        self._decoded_counter = 0
+        self._drawn_counter = 0
+        self._canvas_wh = (1, 1)        # published by the main thread for the worker
 
         self._build_home()
         self._build_session()
@@ -916,11 +935,18 @@ class RemoteDesktopApp(ctk.CTk):
             return
         self.client = ClientBackend(PEER, self.client_events)
         self.client.start()
+        self._decoded = None
+        self._decoded_counter = self._drawn_counter = 0
+        self._decoding = True
+        self._decode_thread = threading.Thread(target=self._decode_worker, daemon=True)
+        self._decode_thread.start()
         self._show_session()
         self._set_message(f"Connecting to {PEER} ...")
         self.after(16, self._render_loop)
 
     def _stop_control(self):
+        self._decoding = False
+        self._decode_thread = None
         if self.client:
             self.client.stop()
             self.client = None
@@ -1013,7 +1039,8 @@ class RemoteDesktopApp(ctk.CTk):
         if self.game_mode:
             self.game_btn.configure(text="🎮 Mouse-look: ON  (F8)", fg_color=GREEN,
                                     hover_color="#128a3e")
-            self.canvas.configure(cursor="none")
+            # show a crosshair reticle at the locked center instead of hiding the cursor
+            self.canvas.configure(cursor="crosshair")
             self.canvas.focus_set()
             self._recenter_pointer()
         else:
@@ -1037,9 +1064,43 @@ class RemoteDesktopApp(ctk.CTk):
     def _set_message(self, text):
         self.canvas.itemconfig(self._msg_id, text=text)
 
+    def _decode_worker(self):
+        """Decode + resize each incoming JPEG off the UI thread (the heavy part)."""
+        last = -1
+        while self._decoding:
+            client = self.client
+            if client is None or not self.client_paired:
+                time.sleep(0.005); continue
+            c = client.frame_counter
+            if c == last:
+                time.sleep(0.002); continue
+            last = c
+            jpeg = client.latest_frame
+            if not jpeg:
+                continue
+            try:
+                arr = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+                if arr is None:
+                    continue
+                fh, fw = arr.shape[:2]
+                cw, ch = self._canvas_wh
+                scale = min(cw / fw, ch / fh)
+                dw, dh = max(int(fw * scale), 1), max(int(fh * scale), 1)
+                if (dw, dh) != (fw, fh):
+                    interp = cv2.INTER_AREA if dw < fw else cv2.INTER_LINEAR
+                    arr = cv2.resize(arr, (dw, dh), interpolation=interp)
+                arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+                ox, oy = (cw - dw) // 2, (ch - dh) // 2
+                self._decoded = (arr, ox, oy, dw, dh, len(jpeg))
+                self._decoded_counter += 1
+            except Exception:
+                continue
+
     def _render_loop(self):
         if self.client is None:
             return
+        # publish the canvas size for the decoder thread (winfo_* is main-thread only)
+        self._canvas_wh = (max(self.canvas.winfo_width(), 1), max(self.canvas.winfo_height(), 1))
         if self._pending_move is not None:
             self.client.send(self._pending_move)
             self._pending_move = None
@@ -1050,36 +1111,26 @@ class RemoteDesktopApp(ctk.CTk):
             if dx or dy:
                 self.client.send({"type": "rmove", "dx": dx, "dy": dy})
             self._pending_rmove = [0, 0]
-        if self.client_paired and self.client.frame_counter != self._last_counter:
-            self._last_counter = self.client.frame_counter
-            frame = self.client.latest_frame
-            if frame:
-                self._draw(frame)
-                self._fps.append(time.time())
-                self._bytes.append((time.time(), len(frame)))
+        if self.client_paired and self._decoded_counter != self._drawn_counter:
+            self._drawn_counter = self._decoded_counter
+            self._draw(self._decoded)
         elif not self.client_paired:
             self._set_message(f"Connecting to {PEER} ...  (is the app open on that PC?)")
         self.after(16, self._render_loop)
 
-    def _draw(self, jpeg):
-        arr = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
-        if arr is None:
+    def _draw(self, decoded):
+        # Runs on the UI thread: only the cheap blit of an already-decoded frame.
+        if not decoded:
             return
-        arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
-        fh, fw = arr.shape[:2]
-        cw = max(self.canvas.winfo_width(), 1)
-        ch = max(self.canvas.winfo_height(), 1)
-        scale = min(cw / fw, ch / fh)
-        dw, dh = max(int(fw * scale), 1), max(int(fh * scale), 1)
-        if (dw, dh) != (fw, fh):
-            interp = cv2.INTER_AREA if dw < fw else cv2.INTER_CUBIC   # sharp both ways
-            arr = cv2.resize(arr, (dw, dh), interpolation=interp)
-        ox, oy = (cw - dw) // 2, (ch - dh) // 2
+        arr, ox, oy, dw, dh, nbytes = decoded
         self.video_rect = (ox, oy, dw, dh)
         self._photo = ImageTk.PhotoImage(Image.fromarray(arr))
         self.canvas.itemconfig(self._msg_id, text="")
         self.canvas.coords(self._img_id, ox, oy)
         self.canvas.itemconfig(self._img_id, image=self._photo)
+        now = time.time()
+        self._fps.append(now)
+        self._bytes.append((now, nbytes))
 
     def _fps_val(self):
         if len(self._fps) < 2:
