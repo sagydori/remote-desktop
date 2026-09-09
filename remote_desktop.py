@@ -85,6 +85,7 @@ SCALE = 1.0                           # capture at native resolution (ceiling)
 SMOOTH_MIN_SCALE = 0.5                # "Smoothest": may drop to half-res to hold the frame rate
 SHARP_MIN_SCALE = 1.0                 # "Sharpest": never downscale (fps may suffer on big screens)
 BIG_FRAME_PIXELS = 2_100_000          # above ~1080p, use faster 4:2:0 chroma instead of 4:4:4
+SMOOTH_TARGET_W = 1920                 # "Smoothest" starts capped near this width on big screens
 DIFF_THRESHOLD = 1.2
 KEYFRAME_EVERY = 2.0
 USE_BETTERCAM = True
@@ -249,11 +250,12 @@ class AdaptiveEncoder:
     + send) takes longer than the target interval. Resolution is dropped first
     (the biggest win for both CPU and bandwidth), then quality."""
 
-    def __init__(self, quality, min_scale=SMOOTH_MIN_SCALE):
+    def __init__(self, quality, min_scale=SMOOTH_MIN_SCALE, start_scale=SCALE, max_scale=SCALE):
         self.max_quality = quality
         self.quality = quality
         self.min_scale = min_scale
-        self.scale = SCALE
+        self.max_scale = max_scale       # ceiling recovery is allowed to climb back to
+        self.scale = start_scale         # where we begin (capped up-front on big screens)
         self._ema = 0.0
 
     def note_frame_time(self, dt, interval):
@@ -266,8 +268,8 @@ class AdaptiveEncoder:
         elif self._ema < interval * 0.5:        # headroom -> improve again
             if self.quality < self.max_quality:
                 self.quality = min(self.max_quality, self.quality + 3)
-            elif self.scale < SCALE:
-                self.scale = round(min(SCALE, self.scale + 0.05), 2)
+            elif self.scale < self.max_scale:
+                self.scale = round(min(self.max_scale, self.scale + 0.05), 2)
 
 
 def monitor_geometry(monitor_index):
@@ -425,8 +427,17 @@ class HostBackend:
         if prev is not None:
             prev.set()
         self._emit("host", "controlled")
-        controller = InputController(*monitor_geometry(self.monitor_index))
-        encoder = AdaptiveEncoder(self.quality, min_scale=self.min_scale)
+        geo = monitor_geometry(self.monitor_index)
+        controller = InputController(*geo)
+        mon_w = max(geo[2], 1)
+        # "Smoothest" starts capped near 1080p on big screens so it's fluid from the
+        # first frame instead of lagging while it adapts down; "Sharpest" stays native.
+        if self.min_scale < 1.0 and mon_w > SMOOTH_TARGET_W:
+            cap = round(SMOOTH_TARGET_W / mon_w, 2)
+            encoder = AdaptiveEncoder(self.quality, min_scale=self.min_scale,
+                                      start_scale=cap, max_scale=cap)
+        else:
+            encoder = AdaptiveEncoder(self.quality, min_scale=self.min_scale)
         paired = asyncio.Event(); paired.set()
         try:
             tasks = [
@@ -545,16 +556,19 @@ class ClientBackend:
         self._async_stop = asyncio.Event()
         self._outgoing = asyncio.Queue()
         backoff = 1
+        first_fail = None                         # when we started failing to connect
+        MAX_CONNECT_WAIT = 90                     # give up after this long (don't latch on later)
         while not self._async_stop.is_set():
             try:
                 self._emit("status", f"Connecting to {PEER} ...")
                 async with websockets.connect(self.uri, max_size=None,
-                                              ping_interval=20, ping_timeout=20) as ws:
+                                              ping_interval=10, ping_timeout=10) as ws:
                     await ws.send(json.dumps({"type": "auth", "token": SECRET}))
                     reply = json.loads(await asyncio.wait_for(ws.recv(), 10))
                     if not reply.get("ok", False):
                         raise ConnectionError("wrong password")
                     self.paired = True
+                    first_fail = None
                     self._emit("paired", True)
                     tasks = [
                         asyncio.create_task(self._recv(ws)),
@@ -570,12 +584,22 @@ class ClientBackend:
                 if self._async_stop.is_set():
                     return
                 backoff = 1
+                first_fail = None
             except ConnectionError as e:
                 self._emit("fatal", str(e)); return
             except (OSError, websockets.WebSocketException, asyncio.TimeoutError) as e:
                 self.paired = False
                 self._emit("paired", False)
                 if self._async_stop.is_set():
+                    return
+                now = time.time()
+                if first_fail is None:
+                    first_fail = now
+                elif now - first_fail > MAX_CONNECT_WAIT:
+                    # Stop instead of retrying forever, so a forgotten "Control" window
+                    # doesn't silently connect (and control) the other PC minutes later.
+                    self._emit("fatal", f"Couldn't reach {PEER}. Make sure it has "
+                                        f"'Allow this PC to be controlled' turned on, then try again.")
                     return
                 self._emit("status", f"Can't reach {PEER} — retry in {backoff}s...")
                 try:
@@ -1057,8 +1081,8 @@ class RemoteDesktopApp(ctk.CTk):
         self.pause_btn.pack(side="left", padx=4, pady=9)
         self.game_btn = self._pill(bar, "🎮 Mouse-look: OFF", self._toggle_game, width=168)
         self.game_btn.pack(side="left", padx=4, pady=9)
-        self._pill(bar, "⛶ Fullscreen", self._toggle_fullscreen, width=118).pack(
-            side="left", padx=4, pady=9)
+        self.full_btn = self._pill(bar, "⛶ Fullscreen", self._toggle_fullscreen, width=134)
+        self.full_btn.pack(side="left", padx=4, pady=9)
         self.stat_label = ctk.CTkLabel(bar, text="connecting…", text_color=TEXT_BODY,
                                        font=ctk.CTkFont(FONT_MONO, 13))
         self.stat_label.pack(side="right", padx=16)
@@ -1228,6 +1252,8 @@ class RemoteDesktopApp(ctk.CTk):
     def _toggle_fullscreen(self):
         self.fullscreen = not self.fullscreen
         self.attributes("-fullscreen", self.fullscreen)
+        if hasattr(self, "full_btn"):
+            self.full_btn.configure(text="⛶ Exit fullscreen" if self.fullscreen else "⛶ Fullscreen")
 
     # ---- rendering -------------------------------------------------------
     def _set_message(self, text):
