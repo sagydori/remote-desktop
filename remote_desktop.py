@@ -146,6 +146,7 @@ DEFAULT_SETTINGS = {
     "sensitivity": 1.0,         # mouse-look turn speed multiplier
     "ui_scale": 1.0,            # overall GUI size (widget scaling)
     "conn_preset": "balanced",  # last quality preset picked before controlling
+    "accent": "#22D3EE",        # customizable accent color
 }
 
 
@@ -189,6 +190,35 @@ def _blend(a, b, t):
     ca = tuple(int(a[i:i + 2], 16) for i in (1, 3, 5))
     cb = tuple(int(b[i:i + 2], 16) for i in (1, 3, 5))
     return "#%02x%02x%02x" % tuple(int(ca[j] + (cb[j] - ca[j]) * t) for j in range(3))
+
+
+def _luma(hex_):
+    r, g, b = (int(hex_[i:i + 2], 16) for i in (1, 3, 5))
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+
+
+# Accent swatches offered in Settings (name -> hex).
+ACCENT_SWATCHES = [
+    ("Cyan", "#22D3EE"), ("Sky", "#38BDF8"), ("Violet", "#A78BFA"),
+    ("Emerald", "#34D399"), ("Amber", "#FBBF24"), ("Rose", "#FB7185"),
+    ("Orange", "#FB923C"), ("Pink", "#F472B6"),
+]
+
+
+def apply_theme(accent):
+    """Reassign the accent-derived colors from one chosen accent hex."""
+    global ACCENT, ACCENT_HOVER, ACCENT_LO, ACCENT_DIM, ON_ACCENT, GRAD
+    try:
+        int(accent[1:], 16)
+        assert accent.startswith("#") and len(accent) == 7
+    except Exception:
+        accent = "#22D3EE"
+    ACCENT = accent
+    ACCENT_HOVER = _blend(accent, "#ffffff", 0.20)
+    ACCENT_LO = _blend(accent, "#000000", 0.18)
+    ACCENT_DIM = _blend(accent, BG, 0.60)
+    ON_ACCENT = "#08141B" if _luma(accent) > 0.55 else "#F2F7FF"
+    GRAD = (ACCENT_HOVER, accent, _blend(accent, "#000000", 0.28))
 
 
 # ===========================================================================
@@ -694,6 +724,7 @@ class RemoteDesktopApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.settings = load_settings()
+        apply_theme(self.settings.get("accent", "#22D3EE"))
         ctk.set_appearance_mode(self.settings.get("appearance", "Dark"))
         try:
             ctk.set_default_color_theme(self.settings.get("theme", "blue"))
@@ -759,6 +790,20 @@ class RemoteDesktopApp(ctk.CTk):
         self.after(80, self._poll)
         self.after(400, self._reassert_icon)   # CTk can reset the icon after init
         self.after(60, self._fade_in)
+        self._pulse_dot()                      # single pulse loop (survives UI rebuilds)
+
+    def _rebuild_ui(self):
+        """Tear down and rebuild the home + session screens (used when the accent
+        color changes so the whole UI recolors live)."""
+        on_home = not (hasattr(self, "session") and self.session.winfo_ismapped())
+        try: self.home.destroy()
+        except Exception: pass
+        try: self.session.destroy()
+        except Exception: pass
+        self._build_home()
+        self._build_session()
+        self._apply_host_state(self.host_state)
+        (self._show_home if on_home else self._show_session)()
 
     def _fade_in(self):
         try:
@@ -894,7 +939,6 @@ class RemoteDesktopApp(ctk.CTk):
             self.home_status.configure(
                 text="⚠  The other-PC name is the same as this PC. Re-run Setup and enter the "
                      "OTHER computer's Tailscale name.")
-        self._pulse_dot()
 
     def _make_card(self, parent, glyph, title, subtitle, accent):
         """A HUD-style action card. Returns the card frame with a `.body` for actions."""
@@ -940,15 +984,18 @@ class RemoteDesktopApp(ctk.CTk):
 
     def _pulse_dot(self):
         # Breathing halo behind the sharing status dot; color depends on host state.
-        self._pulse_t = getattr(self, "_pulse_t", 0.0) + 0.08
         import math
+        self._pulse_t = getattr(self, "_pulse_t", 0.0) + 0.08
         f = (math.sin(self._pulse_t) + 1) / 2
-        if self.host_state == "ready":
-            self.dot_halo.configure(fg_color=_blend(GREEN_HALO, GREEN, f))
-        elif self.host_state == "controlled":
-            self.dot_halo.configure(fg_color=_blend(ACCENT_DIM, ACCENT, f))
-        else:
-            self.dot_halo.configure(fg_color=BG_LAYER)
+        try:
+            if self.host_state == "ready":
+                self.dot_halo.configure(fg_color=_blend(GREEN_HALO, GREEN, f))
+            elif self.host_state == "controlled":
+                self.dot_halo.configure(fg_color=_blend(ACCENT_DIM, ACCENT, f))
+            else:
+                self.dot_halo.configure(fg_color=BG_LAYER)
+        except Exception:
+            pass                       # halo not built yet / being rebuilt
         self.after(60, self._pulse_dot)
 
     # ---- share (host) toggle --------------------------------------------
@@ -976,138 +1023,153 @@ class RemoteDesktopApp(ctk.CTk):
         self._apply_host_state("off")
 
     # ---- settings window -------------------------------------------------
+    def _save(self, **kw):
+        self.settings.update(kw)
+        save_settings(self.settings)
+
+    def _set_accent(self, hex_):
+        """Apply an accent color live across the whole app and remember it."""
+        apply_theme(hex_)
+        self._save(accent=hex_)
+        self._rebuild_ui()
+
     def _open_settings(self):
         win = ctk.CTkToplevel(self)
         win.title("Settings")
-        win.geometry("460x620")
+        win.geometry("500x600")
         win.configure(fg_color=BG)
         win.transient(self)
-        win.after(250, lambda: (win.lift(), win.focus_force()))
+        win.after(220, lambda: (win.lift(), win.focus_force()))
         try:
             win.iconbitmap(ICON)
         except Exception:
             pass
 
+        head = ctk.CTkFrame(win, fg_color="transparent")
+        head.pack(fill="x", padx=26, pady=(22, 0))
+        ctk.CTkLabel(head, text="Settings", text_color=TEXT,
+                     font=ctk.CTkFont(FONT_UI, 22, weight="bold")).pack(anchor="w")
+        self._accent_underline(head, width=52, height=2).pack(anchor="w", pady=(3, 0))
+
         wrap = ctk.CTkScrollableFrame(win, fg_color="transparent")
-        wrap.pack(fill="both", expand=True, padx=22, pady=18)
+        wrap.pack(fill="both", expand=True, padx=20, pady=(12, 4))
 
-        ctk.CTkLabel(wrap, text="Settings", font=ctk.CTkFont(size=20, weight="bold")).pack(
-            anchor="w", pady=(0, 4))
-        ctk.CTkLabel(wrap, text="Personalize the app and how it streams.",
-                     text_color=MUTED, font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(0, 14))
+        def card(title, subtitle=None):
+            c = ctk.CTkFrame(wrap, corner_radius=14, fg_color=CARD,
+                             border_width=1, border_color=BORDER)
+            c.pack(fill="x", pady=8)
+            inner = ctk.CTkFrame(c, fg_color="transparent")
+            inner.pack(fill="x", padx=18, pady=16)
+            ctk.CTkLabel(inner, text=title.upper(), text_color=ACCENT,
+                         font=ctk.CTkFont(FONT_UI, 11, weight="bold")).pack(anchor="w")
+            if subtitle:
+                ctk.CTkLabel(inner, text=subtitle, text_color=MUTED,
+                             font=ctk.CTkFont(FONT_UI, 11)).pack(anchor="w", pady=(1, 8))
+            return inner
 
-        def section(title):
-            ctk.CTkLabel(wrap, text=title.upper(), text_color="#7c8698",
-                         font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", pady=(16, 4))
+        # ---------- Accent color ----------
+        acc = card("Accent color", "Pick a color for the whole app.")
+        swrow = ctk.CTkFrame(acc, fg_color="transparent")
+        swrow.pack(anchor="w", pady=(4, 6))
+        self._swatches = []
 
-        # --- Appearance ---
-        section("Appearance")
+        def refresh_swatches():
+            cur = self.settings.get("accent", "#22D3EE").lower()
+            for hexv, dot in self._swatches:
+                sel = hexv.lower() == cur
+                dot.configure(border_width=3 if sel else 0,
+                              border_color=TEXT if sel else hexv)
+
+        for i, (nm, hexv) in enumerate(ACCENT_SWATCHES):
+            dot = ctk.CTkButton(swrow, text="", width=34, height=34, corner_radius=17,
+                                fg_color=hexv, hover_color=hexv,
+                                command=lambda h=hexv: (self._set_accent(h), refresh_swatches()))
+            dot.grid(row=i // 4, column=i % 4, padx=6, pady=6)
+            self._swatches.append((hexv, dot))
+        refresh_swatches()
+
+        hexrow = ctk.CTkFrame(acc, fg_color="transparent")
+        hexrow.pack(anchor="w", fill="x", pady=(4, 0))
+        hex_entry = ctk.CTkEntry(hexrow, width=130, placeholder_text="#RRGGBB",
+                                 fg_color=SURF_INSET, border_color=BORDER)
+        hex_entry.pack(side="left")
+        hex_entry.insert(0, self.settings.get("accent", "#22D3EE"))
+
+        def apply_hex():
+            v = hex_entry.get().strip()
+            if not v.startswith("#"):
+                v = "#" + v
+            try:
+                assert len(v) == 7 and int(v[1:], 16) >= 0
+                self._set_accent(v)
+                refresh_swatches()
+            except Exception:
+                hex_entry.configure(border_color=RED)
+        ctk.CTkButton(hexrow, text="Apply", width=72, fg_color="transparent", border_width=1,
+                      border_color=BORDER, hover_color=SURF_HOVER, text_color=TEXT,
+                      command=apply_hex).pack(side="left", padx=8)
+
+        # ---------- Appearance ----------
+        ap = card("Appearance", "Light or dark, and overall size.")
         appear_var = ctk.StringVar(value=self.settings.get("appearance", "Dark"))
-        ctk.CTkLabel(wrap, text="Theme mode", font=ctk.CTkFont(size=13)).pack(anchor="w")
-        ctk.CTkOptionMenu(wrap, values=["Dark", "Light", "System"], variable=appear_var,
-                          command=lambda v: ctk.set_appearance_mode(v)).pack(anchor="w", pady=(2, 8))
-
-        color_var = ctk.StringVar(value=self.settings.get("theme", "blue"))
-        ctk.CTkLabel(wrap, text="Accent color  (applies after restart)",
-                     font=ctk.CTkFont(size=13)).pack(anchor="w")
-        ctk.CTkOptionMenu(wrap, values=["blue", "green", "dark-blue"],
-                          variable=color_var).pack(anchor="w", pady=(2, 8))
+        seg = ctk.CTkSegmentedButton(ap, values=["Dark", "Light", "System"], variable=appear_var,
+                                     selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
+                                     command=lambda v: (ctk.set_appearance_mode(v),
+                                                        self._save(appearance=v)))
+        seg.pack(anchor="w", fill="x", pady=(2, 10))
 
         scale_var = ctk.DoubleVar(value=float(self.settings.get("ui_scale", 1.0)))
-        scale_lbl = ctk.CTkLabel(wrap, text=f"Interface size:  {scale_var.get():.2f}x",
-                                 font=ctk.CTkFont(size=13))
+        scale_lbl = ctk.CTkLabel(ap, text=f"Interface size · {scale_var.get():.2f}×",
+                                 text_color=TEXT_BODY, font=ctk.CTkFont(FONT_UI, 13))
         scale_lbl.pack(anchor="w")
 
         def on_scale(v):
-            scale_lbl.configure(text=f"Interface size:  {float(v):.2f}x")
+            scale_lbl.configure(text=f"Interface size · {float(v):.2f}×")
             try:
                 ctk.set_widget_scaling(float(v))
             except Exception:
                 pass
-        ctk.CTkSlider(wrap, from_=0.8, to=1.6, number_of_steps=16, variable=scale_var,
-                      command=on_scale).pack(anchor="w", fill="x", pady=(2, 8))
+            self._save(ui_scale=round(float(v), 2))
+        ctk.CTkSlider(ap, from_=0.8, to=1.6, number_of_steps=16, variable=scale_var,
+                      button_color=ACCENT, button_hover_color=ACCENT_HOVER, progress_color=ACCENT,
+                      command=on_scale).pack(anchor="w", fill="x", pady=(2, 4))
 
-        # --- Controlling games ---
-        section("Controlling games")
+        # ---------- Controlling games ----------
+        gm = card("Controlling games", "Mouse-look (F8) turn speed.")
         sens_var = ctk.DoubleVar(value=float(self.settings.get("sensitivity", 1.0)))
-        sens_lbl = ctk.CTkLabel(wrap, text=f"Mouse-look sensitivity:  {sens_var.get():.2f}x",
-                                font=ctk.CTkFont(size=13))
+        sens_lbl = ctk.CTkLabel(gm, text=f"Sensitivity · {sens_var.get():.2f}×",
+                                text_color=TEXT_BODY, font=ctk.CTkFont(FONT_UI, 13))
         sens_lbl.pack(anchor="w")
-        ctk.CTkSlider(wrap, from_=0.2, to=3.0, number_of_steps=28, variable=sens_var,
-                      command=lambda v: sens_lbl.configure(
-                          text=f"Mouse-look sensitivity:  {float(v):.2f}x")).pack(
-            anchor="w", fill="x", pady=(2, 8))
+        ctk.CTkSlider(gm, from_=0.2, to=3.0, number_of_steps=28, variable=sens_var,
+                      button_color=ACCENT, button_hover_color=ACCENT_HOVER, progress_color=ACCENT,
+                      command=lambda v: (sens_lbl.configure(text=f"Sensitivity · {float(v):.2f}×"),
+                                         self._save(sensitivity=round(float(v), 2)))).pack(
+            anchor="w", fill="x", pady=(2, 4))
 
-        # --- Streaming (when this PC is shared) ---
-        section("Streaming  (when this PC is controlled)")
-        fps_var = ctk.IntVar(value=int(self.settings.get("fps", DEFAULT_FPS)))
-        fps_lbl = ctk.CTkLabel(wrap, text=f"Frame rate:  {fps_var.get()} fps",
-                               font=ctk.CTkFont(size=13))
-        fps_lbl.pack(anchor="w")
-        ctk.CTkSlider(wrap, from_=15, to=75, number_of_steps=12, variable=fps_var,
-                      command=lambda v: fps_lbl.configure(
-                          text=f"Frame rate:  {int(float(v))} fps")).pack(
-            anchor="w", fill="x", pady=(2, 8))
+        ctk.CTkLabel(wrap, text="Resolution & quality are chosen each time you press Connect.",
+                     text_color=MUTED, font=ctk.CTkFont(FONT_UI, 11), wraplength=430,
+                     justify="left").pack(anchor="w", pady=(4, 2))
 
-        q_var = ctk.IntVar(value=int(self.settings.get("quality", DEFAULT_QUALITY)))
-        q_lbl = ctk.CTkLabel(wrap, text=f"Image quality:  {q_var.get()}",
-                             font=ctk.CTkFont(size=13))
-        q_lbl.pack(anchor="w")
-        ctk.CTkSlider(wrap, from_=50, to=100, number_of_steps=50, variable=q_var,
-                      command=lambda v: q_lbl.configure(
-                          text=f"Image quality:  {int(float(v))}")).pack(
-            anchor="w", fill="x", pady=(2, 8))
-        _PRIO = {"smooth": "Smoothest — keep the frame rate (recommended)",
-                 "sharp": "Sharpest — always full resolution"}
-        _PRIO_REV = {v: k for k, v in _PRIO.items()}
-        prio_var = ctk.StringVar(value=_PRIO.get(self.settings.get("priority", "smooth"),
-                                                 _PRIO["smooth"]))
-        ctk.CTkLabel(wrap, text="On big screens (2K/4K)", font=ctk.CTkFont(size=13)).pack(
-            anchor="w", pady=(4, 0))
-        ctk.CTkOptionMenu(wrap, values=list(_PRIO.values()), variable=prio_var,
-                          width=360).pack(anchor="w", pady=(2, 8))
-
-        ctk.CTkLabel(wrap, text="Higher fps / quality look better but use more bandwidth. "
-                               "'Smoothest' briefly lowers resolution when a big screen can't keep "
-                               "up, so it stays fluid; 'Sharpest' never lowers it, so the frame "
-                               "rate may drop. Streaming changes apply next time sharing is turned on.",
-                     text_color=MUTED, font=ctk.CTkFont(size=11), wraplength=380,
-                     justify="left").pack(anchor="w", pady=(2, 6))
-
-        status = ctk.CTkLabel(wrap, text="", text_color=GREEN, font=ctk.CTkFont(size=12))
-        status.pack(anchor="w", pady=(8, 0))
-
-        def do_save():
-            self.settings.update({
-                "appearance": appear_var.get(),
-                "theme": color_var.get(),
-                "ui_scale": round(float(scale_var.get()), 2),
-                "sensitivity": round(float(sens_var.get()), 2),
-                "fps": int(fps_var.get()),
-                "quality": int(q_var.get()),
-                "priority": _PRIO_REV.get(prio_var.get(), "smooth"),
-            })
-            save_settings(self.settings)
-            status.configure(text="✓ Saved.")
+        # ---------- footer ----------
+        foot = ctk.CTkFrame(win, fg_color="transparent")
+        foot.pack(fill="x", padx=26, pady=(0, 18))
 
         def do_reset():
             self.settings = dict(DEFAULT_SETTINGS)
             save_settings(self.settings)
+            apply_theme(self.settings["accent"])
             ctk.set_appearance_mode(self.settings["appearance"])
             try:
                 ctk.set_widget_scaling(self.settings["ui_scale"])
             except Exception:
                 pass
             win.destroy()
-
-        btns = ctk.CTkFrame(wrap, fg_color="transparent")
-        btns.pack(fill="x", pady=(16, 0))
-        ctk.CTkButton(btns, text="Save", fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                      command=do_save).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(btns, text="Save & close", fg_color=GREEN, hover_color="#128a3e",
-                      command=lambda: (do_save(), win.after(150, win.destroy))).pack(side="left")
-        ctk.CTkButton(btns, text="Reset", fg_color="#374151", hover_color="#2c333f",
-                      command=do_reset).pack(side="right")
+            self._rebuild_ui()
+        ctk.CTkButton(foot, text="Reset to defaults", width=150, fg_color="transparent",
+                      border_width=1, border_color=BORDER, hover_color=SURF_HOVER,
+                      text_color=TEXT_BODY, command=do_reset).pack(side="left")
+        ctk.CTkButton(foot, text="Done", width=110, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      text_color=ON_ACCENT, command=win.destroy).pack(side="right")
 
     # ---- session page ----------------------------------------------------
     def _pill(self, parent, text, command, width=118, danger=False):
@@ -1208,19 +1270,26 @@ class RemoteDesktopApp(ctk.CTk):
 
         for key, title, desc, prefs in self.CONN_PRESETS:
             hot = (key == last)
-            b = ctk.CTkFrame(win, corner_radius=12, fg_color=SURF_HOVER if hot else CARD,
-                             border_width=1, border_color=ACCENT if hot else BORDER)
-            b.pack(fill="x", padx=22, pady=6)
-            inner = ctk.CTkButton(b, text="", fg_color="transparent", hover_color=SURF_HOVER,
-                                  corner_radius=12, height=58,
-                                  command=lambda k=key, p=prefs: choose(k, p))
-            inner.pack(fill="both", expand=True)
-            txt = ctk.CTkFrame(inner, fg_color="transparent")
-            txt.place(relx=0.04, rely=0.5, anchor="w")
-            ctk.CTkLabel(txt, text=title, text_color=(ACCENT if hot else TEXT),
-                         font=ctk.CTkFont(FONT_UI, 15, weight="bold")).pack(anchor="w")
-            ctk.CTkLabel(txt, text=desc, text_color=TEXT_BODY,
-                         font=ctk.CTkFont(FONT_UI, 11)).pack(anchor="w")
+            # Button base = the whole area is clickable via its command; the two
+            # overlaid labels are ALSO bound, so clicking the text works too.
+            row = ctk.CTkButton(win, text="", height=64, corner_radius=12,
+                                fg_color=SURF_HOVER if hot else CARD,
+                                hover_color=SURF_HOVER, border_width=1,
+                                border_color=ACCENT if hot else BORDER,
+                                command=lambda k=key, p=prefs: choose(k, p))
+            row.pack(fill="x", padx=22, pady=6)
+            t = ctk.CTkLabel(row, text=title, text_color=(ACCENT if hot else TEXT),
+                             font=ctk.CTkFont(FONT_UI, 15, weight="bold"))
+            t.place(x=18, y=12)
+            d = ctk.CTkLabel(row, text=desc, text_color=TEXT_BODY,
+                             font=ctk.CTkFont(FONT_UI, 11))
+            d.place(x=18, y=36)
+            for lbl in (t, d):
+                lbl.bind("<Button-1>", lambda _e, k=key, p=prefs: choose(k, p))
+                try:
+                    lbl.configure(cursor="hand2")
+                except Exception:
+                    pass
 
     def _begin_control(self, prefs):
         self.client = ClientBackend(PEER, self.client_events, prefs=prefs)
