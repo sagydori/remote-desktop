@@ -383,6 +383,12 @@ class HostBackend:
         if self.loop and self._async_stop:
             self.loop.call_soon_threadsafe(self._async_stop.set)
 
+    def kick(self):
+        """End the current control session but keep sharing on (host stays ready)."""
+        if self.loop and self._session is not None:
+            sess = self._session
+            self.loop.call_soon_threadsafe(sess.set)
+
     def _emit(self, *m): self.events.put(m)
 
     def _thread_main(self):
@@ -418,6 +424,13 @@ class HostBackend:
         return ok
 
     async def _handle(self, ws):
+        addr = ws.remote_address[0] if ws.remote_address else "?"
+        # Reject a PC connecting to itself (misconfigured peer) — that would show up
+        # as being "controlled" with nobody actually there.
+        if addr in ("127.0.0.1", "::1", "localhost"):
+            try: await ws.close()
+            except Exception: pass
+            return
         if not await self._auth(ws):
             await ws.close(); return
         # Take over any existing session instead of rejecting as "busy": a reconnect
@@ -426,7 +439,7 @@ class HostBackend:
         prev, self._session = self._session, my_stop
         if prev is not None:
             prev.set()
-        self._emit("host", "controlled")
+        self._emit("host", "controlled", addr)
         geo = monitor_geometry(self.monitor_index)
         controller = InputController(*geo)
         mon_w = max(geo[2], 1)
@@ -831,6 +844,12 @@ class RemoteDesktopApp(ctk.CTk):
             hover_color=SURF_HOVER, text_color=TEXT,
             font=ctk.CTkFont(FONT_UI, 13, weight="bold"), command=self._toggle_share)
         self.share_btn.pack(side="right")
+        # shown only while someone is controlling this PC — kicks them, keeps sharing on
+        self.kick_btn = ctk.CTkButton(
+            arow, text="Disconnect", width=104, height=34, corner_radius=17,
+            fg_color="transparent", border_width=1, border_color=RED, text_color=RED,
+            hover_color=RED_DIM, font=ctk.CTkFont(FONT_UI, 13, weight="bold"),
+            command=self._kick_controller)
 
         self.home_status = ctk.CTkLabel(self.home, text="", text_color=WARNING,
                                         font=ctk.CTkFont(FONT_UI, 13), wraplength=760,
@@ -1338,24 +1357,40 @@ class RemoteDesktopApp(ctk.CTk):
         return sum(s for t, s in self._bytes if now - t <= 1.0) / 1024.0
 
     # ---- event pump ------------------------------------------------------
-    def _apply_host_state(self, state):
+    def _apply_host_state(self, state, info=None):
         self.host_state = state
         if state == "ready":
             self.dot.configure(text_color=GREEN)
             self.share_label.configure(text="Sharing on — ready", text_color=TEXT_BODY)
+            self._show_kick(False)
         elif state == "controlled":
             self.dot.configure(text_color=ACCENT)
-            self.share_label.configure(text="Being controlled now", text_color=ACCENT)
+            self.share_label.configure(text=f"Controlled by {info}" if info else "Being controlled now",
+                                       text_color=ACCENT)
+            self._show_kick(self.sharing)      # let the user boot the controller
         else:
             self.dot.configure(text_color="#41506a")
             self.share_label.configure(text="Sharing off", text_color=MUTED)
+            self._show_kick(False)
+
+    def _show_kick(self, show):
+        if not hasattr(self, "kick_btn"):
+            return
+        if show:
+            self.kick_btn.pack(side="right", padx=(0, 8))
+        else:
+            self.kick_btn.pack_forget()
+
+    def _kick_controller(self):
+        if self.host:
+            self.host.kick()
 
     def _poll(self):
         try:
             while True:
                 m = self.host_events.get_nowait()
                 if m[0] == "host":
-                    self._apply_host_state(m[1])
+                    self._apply_host_state(m[1], m[2] if len(m) > 2 else None)
         except queue.Empty:
             pass
         try:
