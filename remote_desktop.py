@@ -122,6 +122,12 @@ KEYFRAME_EVERY = 2.0
 USE_BETTERCAM = True
 DEFAULT_QUALITY = 90                  # high quality; edges/text stay crisp
 DEFAULT_FPS = 60                      # smooth 60 fps
+# Client-side draw cap. Blitting a full 1080p frame to the Tk canvas costs ~50 ms
+# (~20 fps) no matter how fast the network and encoder are — the cost scales with the
+# number of pixels drawn. In "smooth" priority we cap the *drawn* width so the frame
+# rate stays high (~45 fps at 1440); the image is centered and a small side border may
+# show on a bigger window. "sharp" priority draws at full canvas size for max crispness.
+RENDER_MAX_W_SMOOTH = 1440
 
 # palette  —  cyan-on-deep-navy "command console" (dark base + one neon accent)
 BG          = "#0A0E14"   # deepest window background
@@ -493,6 +499,7 @@ class HostBackend:
         self.loop = None
         self._async_stop = None
         self._session = None            # the Event that ends the CURRENT control session
+        self._errored = False           # set when startup fails, so we show why
 
     def start(self):
         threading.Thread(target=self._thread_main, daemon=True).start()
@@ -512,25 +519,40 @@ class HostBackend:
     def _thread_main(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
+        self._errored = False
         try:
             self.loop.run_until_complete(self._run())
         except Exception as e:
-            self._emit("log", f"Share error: {e}")
+            self._errored = True
+            self._emit("host", "error", f"Couldn't start sharing: {e}")
         finally:
-            self._emit("host", "offline")
+            # Don't overwrite a visible error message with a plain "off" state.
+            if not self._errored:
+                self._emit("host", "offline")
 
     async def _run(self):
         self._async_stop = asyncio.Event()
-        self._capture = Capture(self.monitor_index, self._emit)
+        try:
+            self._capture = Capture(self.monitor_index, self._emit)
+        except Exception as e:
+            self._errored = True
+            self._emit("host", "error", f"Can't capture this screen: {e}")
+            return
         try:
             async with websockets.serve(self._handle, "0.0.0.0", PORT, max_size=None,
                                         ping_interval=10, ping_timeout=10):
                 self._emit("host", "ready")
                 await self._async_stop.wait()
-        except OSError as e:
-            self._emit("log", f"Could not listen on port {PORT}: {e}")
+        except OSError:
+            self._errored = True
+            self._emit("host", "error",
+                       f"Port {PORT} is already in use — another copy of this app may "
+                       f"already be sharing. Close it and turn sharing on again.")
         finally:
-            self._capture.close()
+            try:
+                self._capture.close()
+            except Exception:
+                pass
 
     async def _auth(self, ws):
         prefs = {}
@@ -1090,14 +1112,21 @@ class RemoteDesktopApp(ctk.CTk):
 
     def _start_share(self):
         min_scale = SHARP_MIN_SCALE if self.settings.get("priority") == "sharp" else SMOOTH_MIN_SCALE
-        self.host = HostBackend(self.host_events,
-                                quality=int(self.settings.get("quality", DEFAULT_QUALITY)),
-                                fps=int(self.settings.get("fps", DEFAULT_FPS)),
-                                min_scale=min_scale)
-        self.host.start()
+        self.home_status.configure(text="")          # clear any earlier error
+        try:
+            self.host = HostBackend(self.host_events,
+                                    quality=int(self.settings.get("quality", DEFAULT_QUALITY)),
+                                    fps=int(self.settings.get("fps", DEFAULT_FPS)),
+                                    min_scale=min_scale)
+            self.host.start()
+        except Exception as e:
+            self.host = None
+            self._apply_host_state("error", f"Couldn't start sharing: {e}")
+            return
         self.sharing = True
         self.share_btn.configure(text="Turn off", border_color=RED, text_color=RED,
                                  hover_color=RED_DIM)
+        self._apply_host_state("starting")            # amber until the thread reports "ready"
 
     def _stop_share(self):
         if self.host:
@@ -1577,6 +1606,11 @@ class RemoteDesktopApp(ctk.CTk):
                 cw, ch = self._canvas_wh
                 scale = min(cw / fw, ch / fh)
                 dw, dh = max(int(fw * scale), 1), max(int(fh * scale), 1)
+                # Smooth mode: cap the DRAWN size so the UI blit stays cheap (big fps win).
+                # Drawing full 1080p is ~50 ms/frame (~20 fps); ~1440-wide is ~22 ms (~45 fps).
+                if self.settings.get("priority") != "sharp" and dw > RENDER_MAX_W_SMOOTH:
+                    r = RENDER_MAX_W_SMOOTH / dw
+                    dw, dh = RENDER_MAX_W_SMOOTH, max(int(dh * r), 1)
                 if (dw, dh) != (fw, fh):
                     interp = cv2.INTER_AREA if dw < fw else cv2.INTER_LINEAR
                     arr = cv2.resize(arr, (dw, dh), interpolation=interp)
@@ -1615,7 +1649,14 @@ class RemoteDesktopApp(ctk.CTk):
             return
         arr, ox, oy, dw, dh, nbytes = decoded
         self.video_rect = (ox, oy, dw, dh)
-        self._photo = ImageTk.PhotoImage(Image.fromarray(arr))
+        pil = Image.fromarray(arr)
+        # Reuse the same Tk image and repaint its pixels in place — this is much faster
+        # than building a new PhotoImage every frame (which alone caps ~1080p near 20 fps).
+        # Only (re)create it when the drawn size changes (e.g. the window was resized).
+        if self._photo is not None and (self._photo.width(), self._photo.height()) == (dw, dh):
+            self._photo.paste(pil)
+        else:
+            self._photo = ImageTk.PhotoImage(pil)
         self.canvas.itemconfig(self._msg_id, text="")
         self.canvas.coords(self._img_id, ox, oy)
         self.canvas.itemconfig(self._img_id, image=self._photo)
@@ -1645,6 +1686,20 @@ class RemoteDesktopApp(ctk.CTk):
             self.share_label.configure(text=f"Controlled by {info}" if info else "Being controlled now",
                                        text_color=ACCENT)
             self._show_kick(self.sharing)      # let the user boot the controller
+        elif state == "starting":
+            self.dot.configure(text_color=WARNING)
+            self.share_label.configure(text="Starting…", text_color=WARNING)
+            self._show_kick(False)
+        elif state == "error":
+            self.sharing = False
+            self.host = None
+            self.dot.configure(text_color=RED)
+            self.share_label.configure(text="Couldn't start", text_color=RED)
+            self.share_btn.configure(text="Turn on", border_color=BORDER,
+                                     text_color=TEXT, hover_color=SURF_HOVER)
+            if info:
+                self.home_status.configure(text=f"⚠  {info}")
+            self._show_kick(False)
         else:
             self.dot.configure(text_color="#41506a")
             self.share_label.configure(text="Sharing off", text_color=MUTED)
