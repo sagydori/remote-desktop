@@ -242,6 +242,12 @@ TEXT        = "#E6EDF6"   # headings / primary text
 TEXT_BODY   = "#9FB0C3"   # body text
 MUTED       = "#64748B"   # captions / eyebrows / disabled
 GRAD = ("#22D3EE", "#38BDF8", "#3B82F6")   # cyan -> sky -> blue accent gradient
+# deep-space starfield palette (home-screen background)
+SPACE_BG      = "#05060C"   # the void at the bottom of the sky
+SPACE_TOP     = "#0C1230"   # indigo glow at the top of the sky
+SPACE_NEBULA1 = (86, 52, 158)    # violet nebula cloud
+SPACE_NEBULA2 = (24, 74, 110)    # teal nebula cloud
+SPACE_STAR    = "#DDE8FF"   # star tint (pale blue-white)
 FONT_UI = "Segoe UI"      # native on Windows 11
 FONT_MONO = "Consolas"    # native monospace for the stat readout
 
@@ -1081,11 +1087,13 @@ class RemoteDesktopApp(ctk.CTk):
     def _build_home(self):
         self.home = ctk.CTkFrame(self, fg_color=BG)
 
-        # faint dot-grid texture behind everything
+        # deep-space starfield behind everything (stars, nebula, a planet + a satellite)
         import tkinter as tk
-        self._grid_canvas = tk.Canvas(self.home, bg=BG, highlightthickness=0, bd=0)
+        self._grid_canvas = tk.Canvas(self.home, bg=SPACE_BG, highlightthickness=0, bd=0)
         self._grid_canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
-        self._grid_canvas.bind("<Configure>", self._draw_grid)
+        self._grid_canvas.bind("<Configure>", self._draw_space)
+        self._star_t = 0.0
+        self.after(120, self._twinkle)
 
         header = ctk.CTkFrame(self.home, fg_color="transparent")
         header.pack(fill="x", padx=32, pady=(22, 0))
@@ -1205,14 +1213,140 @@ class RemoteDesktopApp(ctk.CTk):
             w.bind("<Enter>", enter); w.bind("<Leave>", leave)
         return card
 
-    def _draw_grid(self, event):
-        c = self._grid_canvas
-        c.delete("grid")
-        step = 34
-        for x in range(0, event.width, step):
-            for y in range(0, event.height, step):
-                c.create_oval(x, y, x + 2, y + 2, fill="#141c28", outline="", tags="grid")
-        c.lower("grid")
+    # ---- deep-space background -------------------------------------------
+    def _draw_space(self, event=None):
+        """Paint the starfield sky: vertical gradient, two nebula clouds, a planet,
+        a satellite, and a field of stars (twinkled separately)."""
+        import random
+        c = getattr(self, "_grid_canvas", None)
+        if c is None or not c.winfo_exists():
+            return
+        w = event.width if event is not None else c.winfo_width()
+        h = event.height if event is not None else c.winfo_height()
+        if w < 4 or h < 4:
+            return
+        c.delete("space")
+        # 1) vertical gradient sky (indigo at the top -> the void at the bottom)
+        top = tuple(int(SPACE_TOP[i:i + 2], 16) for i in (1, 3, 5))
+        bot = tuple(int(SPACE_BG[i:i + 2], 16) for i in (1, 3, 5))
+        bands = 48
+        for i in range(bands):
+            t = i / (bands - 1)
+            col = "#%02x%02x%02x" % tuple(int(top[j] + (bot[j] - top[j]) * t) for j in range(3))
+            c.create_rectangle(0, int(h * i / bands), w, int(h * (i + 1) / bands) + 1,
+                               fill=col, outline="", tags=("space", "bg"))
+        # 2) nebula clouds (soft glows blended toward the void)
+        self._draw_nebula(c, int(w * 0.80), int(h * 0.24), max(w, h) * 0.55, SPACE_NEBULA1)
+        self._draw_nebula(c, int(w * 0.12), int(h * 0.86), max(w, h) * 0.42, SPACE_NEBULA2)
+        # 3) the star field
+        if getattr(self, "_stars", None) is None or self._stars_wh != (w, h):
+            rnd = random.Random(42)
+            self._stars = [(rnd.randint(0, w), rnd.randint(0, h),
+                            rnd.choice([1, 1, 1, 1, 2, 2, 3]), rnd.random())
+                           for _ in range(190)]
+            self._stars_wh = (w, h)
+        self._paint_stars(c)
+        # 4) foreground bodies (drawn above the stars)
+        self._draw_planet(c, int(w * 0.86), int(h * 0.82), max(18, int(min(w, h) * 0.085)))
+        self._draw_satellite(c, int(w * 0.19), int(h * 0.30), max(0.8, min(w, h) / 700))
+        # a lone shooting star streak, top-left quadrant
+        sx, sy = int(w * 0.30), int(h * 0.16)
+        for k in range(10):
+            t = k / 9
+            col = _blend(SPACE_BG, SPACE_STAR, 1 - t)
+            c.create_line(sx - k * 7, sy - k * 3, sx - (k + 1) * 7, sy - (k + 1) * 3,
+                          fill=col, width=2, tags=("space", "fg"))
+        c.lower("space")
+
+    def _paint_stars(self, c):
+        import math
+        c.delete("star")
+        for (sx, sy, sr, ph) in getattr(self, "_stars", []):
+            tw = 0.55 + 0.45 * math.sin(self._star_t + ph * 6.283)   # per-star twinkle
+            b = int(120 + 135 * tw)
+            col = "#%02x%02x%02x" % (b, b, min(255, b + 18))
+            c.create_oval(sx - sr, sy - sr, sx + sr, sy + sr, fill=col, outline="",
+                          tags=("space", "star"))
+            if sr >= 3:                                              # a glint on the brightest
+                c.create_line(sx - 6, sy, sx + 6, sy, fill=col, tags=("space", "star"))
+                c.create_line(sx, sy - 6, sx, sy + 6, fill=col, tags=("space", "star"))
+
+    def _draw_nebula(self, c, cx, cy, radius, rgb):
+        """A soft radial glow built from concentric ovals blended toward the void."""
+        hexcol = "#%02x%02x%02x" % rgb
+        layers = 16
+        for i in range(layers):
+            t = i / (layers - 1)
+            r = radius * (1 - t)
+            col = _blend(SPACE_BG, hexcol, (1 - t) * 0.28)           # subtle, brighter in the core
+            c.create_oval(cx - r, cy - r * 0.72, cx + r, cy + r * 0.72,
+                          fill=col, outline="", tags=("space", "bg"))
+
+    def _draw_planet(self, c, cx, cy, r):
+        """A ringed planet with a lit limb and a couple of bands."""
+        # ring behind
+        c.create_oval(cx - r * 1.9, cy - r * 0.55, cx + r * 1.9, cy + r * 0.55,
+                      outline=_blend(SPACE_BG, "#C4B5FD", 0.55), width=max(2, int(r * 0.10)),
+                      tags=("space", "fg"))
+        # body with a simple day/night shade (concentric offset ovals)
+        base = "#7C3AED"
+        for i in range(10):
+            t = i / 9
+            rr = r * (1 - t * 0.06)
+            ox = int(r * 0.16 * t)                                    # shift toward the lit side
+            col = _blend("#2A1A5E", base, 0.35 + 0.65 * t)
+            c.create_oval(cx - rr - ox, cy - rr, cx + rr - ox, cy + rr,
+                          fill=col, outline="", tags=("space", "fg"))
+        # bright highlight
+        c.create_oval(cx - r * 0.5, cy - r * 0.6, cx - r * 0.1, cy - r * 0.2,
+                      fill=_blend(base, "#EDE9FE", 0.5), outline="", tags=("space", "fg"))
+        # ring front (over the body, lower half)
+        c.create_arc(cx - r * 1.9, cy - r * 0.55, cx + r * 1.9, cy + r * 0.55,
+                     start=180, extent=180, style="arc",
+                     outline=_blend(SPACE_BG, "#DDD6FE", 0.7), width=max(2, int(r * 0.10)),
+                     tags=("space", "fg"))
+
+    def _draw_satellite(self, c, cx, cy, s):
+        """A little satellite: body, two solar-panel wings, a dish and an antenna."""
+        A = ACCENT
+        def R(x0, y0, x1, y1, fill, outline="", wdt=1):
+            c.create_rectangle(cx + x0 * s, cy + y0 * s, cx + x1 * s, cy + y1 * s,
+                               fill=fill, outline=outline, width=wdt, tags=("space", "fg"))
+        def L(x0, y0, x1, y1, fill, wdt=1):
+            c.create_line(cx + x0 * s, cy + y0 * s, cx + x1 * s, cy + y1 * s,
+                          fill=fill, width=wdt, tags=("space", "fg"))
+        panel = _blend(SPACE_BG, A, 0.55)
+        edge = _blend(SPACE_BG, A, 0.9)
+        # solar wings
+        for side in (-1, 1):
+            R(side * 20, -16, side * 52, 16, panel, edge, 1)
+            for gx in range(1, 4):                                    # cell lines
+                L(side * (20 + gx * 8), -16, side * (20 + gx * 8), 16, edge, 1)
+            L(side * 12, 0, side * 20, 0, edge, max(1, int(2 * s)))    # strut
+        # body
+        R(-12, -14, 12, 14, _blend(SPACE_BG, "#CBD5E1", 0.75), edge, 1)
+        R(-8, -10, 8, 10, _blend(SPACE_BG, A, 0.35), "", 0)
+        # dish
+        c.create_oval(cx - 9 * s, cy - 30 * s, cx + 9 * s, cy - 12 * s,
+                      outline=edge, width=max(1, int(1.6 * s)), tags=("space", "fg"))
+        L(0, -14, 0, -21, edge, max(1, int(1.6 * s)))                 # dish mast
+        c.create_oval(cx - 1.6 * s, cy - 22.6 * s, cx + 1.6 * s, cy - 19.4 * s,
+                      fill=edge, outline="", tags=("space", "fg"))
+
+    def _twinkle(self):
+        import math
+        c = getattr(self, "_grid_canvas", None)
+        if c is None or not c.winfo_exists():
+            return                                                    # home rebuilt/closed — let this loop die
+        self._star_t += 0.22
+        try:
+            if getattr(self, "_stars", None):
+                self._paint_stars(c)
+                c.tag_raise("fg")                                     # keep planet/satellite above the stars
+                c.tag_lower("bg")                                     # keep sky/nebula behind the stars
+        except Exception:
+            pass
+        self.after(140, self._twinkle)
 
     def _pulse_dot(self):
         # Breathing halo behind the sharing status dot; color depends on host state.
