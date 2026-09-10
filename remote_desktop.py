@@ -24,7 +24,7 @@ import cv2
 import mss
 import numpy as np
 import customtkinter as ctk
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw, ImageFilter
 from pynput.keyboard import Controller as KeyboardController, Key, KeyCode
 from pynput.mouse import Button, Controller as MouseController
 import websockets
@@ -323,6 +323,121 @@ def _blend(a, b, t):
 def _luma(hex_):
     r, g, b = (int(hex_[i:i + 2], 16) for i in (1, 3, 5))
     return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+
+
+def _rgb(hex_):
+    return tuple(int(hex_[i:i + 2], 16) for i in (1, 3, 5))
+
+
+_SHIP_SPRITE_CACHE = {}
+
+
+def _build_ship_sprite(accent="#A78BFA", px=150):
+    """A shaded, anti-aliased rocket sprite (RGBA), nose pointing RIGHT (+x).
+    Drawn at 4x and downscaled for smooth edges; cached per accent color."""
+    key = (accent, px)
+    if key in _SHIP_SPRITE_CACHE:
+        return _SHIP_SPRITE_CACHE[key]
+    SS = 4
+    D = px * SS
+    cx = cy = D / 2
+
+    def e(v):                                   # final-px -> supersampled int
+        return int(round(v * SS))
+
+    A = _rgb(accent)
+    Ahi = tuple(int(a + (255 - a) * 0.55) for a in A)
+    Alo = tuple(int(a * 0.45) for a in A)
+
+    body = Image.new("RGBA", (D, D), (0, 0, 0, 0))
+    glow = Image.new("RGBA", (D, D), (0, 0, 0, 0))
+    dr = ImageDraw.Draw(body)
+    gr = ImageDraw.Draw(glow)
+
+    # ---- engine glow (soft, behind everything) ----
+    for r, al in ((70, 70), (48, 110), (30, 170), (16, 230)):
+        gr.ellipse([e(-64) + cx - e(r), cy - e(r * 0.6), e(-64) + cx + e(r), cy + e(r * 0.6)],
+                   fill=(255, 150, 60, al))
+    glow = glow.filter(ImageFilter.GaussianBlur(SS * 5))
+
+    # ---- rear fins (drawn first, behind hull) ----
+    steel_d = (74, 84, 99)
+    for sgn in (-1, 1):
+        dr.polygon([(e(-30) + cx, cy + sgn * e(14)), (e(-58) + cx, cy + sgn * e(40)),
+                    (e(-30) + cx, cy + sgn * e(22)), (e(-14) + cx, cy + sgn * e(18))],
+                   fill=steel_d)
+
+    # ---- fuselage: rounded capsule filled with a vertical (cylindrical) gradient ----
+    bx0, by0, bx1, by1 = e(-56) + cx, cy - e(24), e(40) + cx, cy + e(24)
+    mask = Image.new("L", (D, D), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([bx0, by0, bx1, by1], radius=e(24), fill=255)
+    stops = [(0.0, (247, 250, 255)), (0.16, (214, 223, 235)), (0.4, (150, 162, 180)),
+             (0.62, (108, 120, 138)), (1.0, (64, 72, 86))]
+    grad = Image.new("RGB", (1, D))
+    gp = grad.load()
+    for y in range(D):
+        t = min(1.0, max(0.0, (y - by0) / max(by1 - by0, 1)))
+        for k in range(len(stops) - 1):
+            p0, c0 = stops[k]; p1, c1 = stops[k + 1]
+            if t <= p1 or k == len(stops) - 2:
+                f = 0 if p1 == p0 else (t - p0) / (p1 - p0)
+                f = max(0.0, min(1.0, f))
+                gp[0, y] = tuple(int(c0[j] + (c1[j] - c0[j]) * f) for j in range(3))
+                break
+    body.paste(grad.resize((D, D)), (0, 0), mask)
+    # specular highlight band + belly shadow
+    dr.line([(bx0 + e(10), by0 + e(7)), (bx1 - e(6), by0 + e(7))],
+            fill=(255, 255, 255, 150), width=SS * 2)
+    dr.line([(bx0 + e(10), by1 - e(6)), (bx1 - e(10), by1 - e(6))],
+            fill=(30, 36, 46, 120), width=SS * 2)
+    # panel seams
+    for sx in (-30, -8, 16):
+        dr.line([(e(sx) + cx, by0 + e(5)), (e(sx) + cx, by1 - e(5))], fill=(70, 78, 92, 140), width=SS)
+
+    # ---- nose cone (accent, shaded) ----
+    nose_mask = Image.new("L", (D, D), 0)
+    ImageDraw.Draw(nose_mask).polygon([(e(38) + cx, cy - e(22)), (e(74) + cx, cy),
+                                       (e(38) + cx, cy + e(22))], fill=255)
+    ngrad = Image.new("RGB", (1, D)); ngp = ngrad.load()
+    for y in range(D):
+        t = min(1.0, max(0.0, (y - (cy - e(22))) / max(e(44), 1)))
+        ngp[0, y] = tuple(int(Ahi[j] + (Alo[j] - Ahi[j]) * t) for j in range(3))
+    body.paste(ngrad.resize((D, D)), (0, 0), nose_mask)
+
+    # ---- cockpit: glass dome with rim + glint ----
+    dr.ellipse([e(-4) + cx, cy - e(15), e(30) + cx, cy + e(15)], fill=(18, 24, 40, 255))
+    gmask = Image.new("L", (D, D), 0)
+    ImageDraw.Draw(gmask).ellipse([e(-1) + cx, cy - e(12), e(27) + cx, cy + e(12)], fill=255)
+    ggrad = Image.new("RGB", (1, D)); ggp = ggrad.load()
+    gs = [(0.0, (190, 226, 255)), (0.5, (86, 150, 220)), (1.0, (26, 52, 96))]
+    for y in range(D):
+        t = min(1.0, max(0.0, (y - (cy - e(12))) / max(e(24), 1)))
+        for k in range(len(gs) - 1):
+            p0, c0 = gs[k]; p1, c1 = gs[k + 1]
+            if t <= p1 or k == len(gs) - 2:
+                f = 0 if p1 == p0 else max(0.0, min(1.0, (t - p0) / (p1 - p0)))
+                ggp[0, y] = tuple(int(c0[j] + (c1[j] - c0[j]) * f) for j in range(3))
+                break
+    body.paste(ggrad.resize((D, D)), (0, 0), gmask)
+    dr.ellipse([e(2) + cx, cy - e(9), e(12) + cx, cy - e(1)], fill=(255, 255, 255, 210))
+
+    # ---- engine nozzles ----
+    for oy in (-11, 0, 11):
+        dr.polygon([(e(-56) + cx, cy + e(oy) - e(5)), (e(-64) + cx, cy + e(oy) - e(7)),
+                    (e(-64) + cx, cy + e(oy) + e(7)), (e(-56) + cx, cy + e(oy) + e(5))],
+                   fill=(52, 60, 74))
+
+    # ---- running lights (with a soft halo) ----
+    for (lx, ly, col) in ((-30, -40, (52, 211, 153)), (-30, 40, (248, 113, 113))):
+        gr2 = ImageDraw.Draw(glow)
+        gr2.ellipse([e(lx) + cx - e(6), cy + e(ly) - e(6), e(lx) + cx + e(6), cy + e(ly) + e(6)],
+                    fill=col + (150,))
+        dr.ellipse([e(lx) + cx - e(3), cy + e(ly) - e(3), e(lx) + cx + e(3), cy + e(ly) + e(3)],
+                   fill=col + (255,))
+
+    out = Image.alpha_composite(glow, body).resize((px, px), Image.LANCZOS)
+    _SHIP_SPRITE_CACHE[key] = out
+    return out
 
 
 # Accent swatches offered in Settings (name -> hex).
@@ -1093,7 +1208,10 @@ class RemoteDesktopApp(ctk.CTk):
         self._grid_canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._grid_canvas.bind("<Configure>", self._draw_space)
         self._star_t = 0.0
-        self.after(120, self._twinkle)
+        self._ship = None
+        self._anim_i = 0
+        self._ship_rots = {}           # cache of rotated ship PhotoImages, keyed by angle
+        self.after(120, self._animate)
 
         header = ctk.CTkFrame(self.home, fg_color="transparent")
         header.pack(fill="x", padx=32, pady=(22, 0))
@@ -1333,20 +1451,69 @@ class RemoteDesktopApp(ctk.CTk):
         c.create_oval(cx - 1.6 * s, cy - 22.6 * s, cx + 1.6 * s, cy - 19.4 * s,
                       fill=edge, outline="", tags=("space", "fg"))
 
-    def _twinkle(self):
-        import math
+    def _animate(self):
+        """Home-screen animation loop (~28 fps): a rocket flies across, stars twinkle."""
         c = getattr(self, "_grid_canvas", None)
         if c is None or not c.winfo_exists():
             return                                                    # home rebuilt/closed — let this loop die
-        self._star_t += 0.22
+        self._anim_i = getattr(self, "_anim_i", 0) + 1
         try:
-            if getattr(self, "_stars", None):
+            if self._anim_i % 4 == 0 and getattr(self, "_stars", None):   # twinkle ~7 fps
+                self._star_t += 0.5
                 self._paint_stars(c)
-                c.tag_raise("fg")                                     # keep planet/satellite above the stars
-                c.tag_lower("bg")                                     # keep sky/nebula behind the stars
+            self._fly_ship(c)                                         # rocket every frame (smooth)
+            # keep the z-order: sky/nebula < stars < planet/satellite < rocket
+            c.tag_lower("bg"); c.tag_raise("star"); c.tag_raise("fg"); c.tag_raise("ship")
         except Exception:
             pass
-        self.after(140, self._twinkle)
+        self.after(36, self._animate)
+
+    def _fly_ship(self, c):
+        import math
+        w, h = getattr(self, "_stars_wh", None) or (c.winfo_width(), c.winfo_height())
+        s = getattr(self, "_ship", None)
+        if s is None:
+            s = {"a": 0.0, "trail": []}
+            self._ship = s
+        s["a"] = (s["a"] + 0.026) % (2 * math.pi)                    # advance around the orbit
+        cx0, cy0 = w * 0.5, h * 0.52
+        rx, ry = w * 0.42, h * 0.40                                  # big ellipse that laps the app
+        a = s["a"]
+        x = cx0 + rx * math.cos(a)
+        y = cy0 + ry * math.sin(a)
+        heading = math.atan2(ry * math.cos(a), -rx * math.sin(a))    # face the direction of travel
+        s["trail"].append((x, y))
+        if len(s["trail"]) > 40:
+            s["trail"].pop(0)
+        c.delete("ship")
+        # glowing exhaust trail that fades out behind the ship (it "leaves stuff")
+        n = len(s["trail"])
+        for i, (tx, ty) in enumerate(s["trail"][:-1]):
+            t = i / max(n - 1, 1)
+            col = _blend(SPACE_BG, ("#5EEAD4" if i % 2 else "#A78BFA"), 0.12 + t * 0.72)
+            r = 0.6 + 3.6 * t
+            c.create_oval(tx - r, ty - r, tx + r, ty + r, fill=col, outline="",
+                          tags=("space", "ship"))
+        self._draw_ship(c, x, y, heading)
+
+    def _draw_ship(self, c, x, y, ang=0.0):
+        """Blit the shaded rocket sprite, rotated to point along `ang` (its heading)."""
+        import math
+        try:
+            base = _build_ship_sprite(ACCENT, 150)
+            deg = int(round(-math.degrees(ang) / 5.0)) * 5 % 360     # quantize to 5° (cache-friendly)
+            photo = self._ship_rots.get(deg)
+            if photo is None:
+                rot = base.rotate(deg, expand=True, resample=Image.BICUBIC)
+                photo = ImageTk.PhotoImage(rot)
+                self._ship_rots[deg] = photo                         # keep a ref so it isn't GC'd
+            c.create_image(x, y, image=photo, tags=("space", "ship"))
+        except Exception:
+            A = ACCENT                                               # minimal fallback (never crash the UI)
+            c.create_oval(x - 14, y - 7, x + 14, y + 7, fill="#E5E7EB",
+                          outline=A, tags=("space", "ship"))
+            c.create_polygon(x + 14, y - 7, x + 28, y, x + 14, y + 7,
+                             fill=A, outline="", tags=("space", "ship"))
 
     def _pulse_dot(self):
         # Breathing halo behind the sharing status dot; color depends on host state.
