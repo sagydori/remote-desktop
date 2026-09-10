@@ -95,19 +95,110 @@ if os.name == "nt":
         """Screen (x, y) of the mouse cursor if it is currently VISIBLE, else None.
         Games hide the cursor during play (returns None) and show it in menus/
         inventories (returns the position) — exactly when the controller needs it."""
+        x, y, _hc = cursor_state() if True else (None, None, None)
+        return (x, y) if x is not None else None
+
+    def cursor_state():
+        """(screen_x, screen_y, hCursor) if the cursor is visible, else (None, None, None).
+        hCursor identifies the shape (arrow / I-beam / hand / …) so we can render the REAL
+        cursor rather than a generic drawn arrow."""
         ci = _CURSORINFO()
         ci.cbSize = ctypes.sizeof(_CURSORINFO)
         try:
             if ctypes.windll.user32.GetCursorInfo(ctypes.byref(ci)) and (ci.flags & _CURSOR_SHOWING):
-                return ci.ptScreenPos.x, ci.ptScreenPos.y
+                return ci.ptScreenPos.x, ci.ptScreenPos.y, ci.hCursor
         except Exception:
             pass
-        return None
+        return None, None, None
+
+    # ---- render the ACTUAL system cursor bitmap (any shape) --------------------
+    _user32 = ctypes.windll.user32
+    _gdi32 = ctypes.windll.gdi32
+    # Declare handle-returning calls as pointer-wide so 64-bit handles aren't truncated.
+    _gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+    _gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+    _gdi32.CreateDIBSection.restype = ctypes.c_void_p
+    _gdi32.CreateDIBSection.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+                                        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+                                        wintypes.DWORD]
+    _gdi32.SelectObject.restype = ctypes.c_void_p
+    _gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    _gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+    _gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+    _user32.GetDC.restype = ctypes.c_void_p
+    _user32.GetDC.argtypes = [ctypes.c_void_p]
+    _user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    _user32.DrawIconEx.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
+
+    class _BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                    ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                    ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                    ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                    ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                    ("biClrImportant", wintypes.DWORD)]
+
+    _DI_NORMAL = 0x0003
+    _CURSOR_PX = 32                       # standard cursor size we render at (native pixels)
+    _cursor_cache = {}                    # hCursor -> (color_bgr float32, transparency float32) or None
+
+    def _draw_cursor_on(hcursor, bg):
+        """Draw the cursor onto a solid `bg` (0 or 255) 32x32 DIB; return (32,32,3) BGR float32."""
+        import numpy as _np
+        w = h = _CURSOR_PX
+        hdc_screen = _user32.GetDC(0)
+        hdc = _gdi32.CreateCompatibleDC(hdc_screen)
+        bmi = _BITMAPINFOHEADER()
+        bmi.biSize = ctypes.sizeof(bmi); bmi.biWidth = w; bmi.biHeight = -h
+        bmi.biPlanes = 1; bmi.biBitCount = 32; bmi.biCompression = 0
+        ppv = ctypes.c_void_p()
+        hbm = _gdi32.CreateDIBSection(hdc, ctypes.byref(bmi), 0, ctypes.byref(ppv), None, 0)
+        old = _gdi32.SelectObject(hdc, hbm)
+        try:
+            ctypes.memset(ppv, bg, w * h * 4)
+            _user32.DrawIconEx(hdc, 0, 0, hcursor, w, h, 0, None, _DI_NORMAL)
+            _gdi32.GdiFlush()
+            raw = (ctypes.c_ubyte * (w * h * 4)).from_address(ppv.value)
+            arr = _np.frombuffer(bytes(raw), _np.uint8).reshape(h, w, 4)[:, :, :3].astype(_np.float32)
+        finally:
+            _gdi32.SelectObject(hdc, old); _gdi32.DeleteObject(hbm)
+            _gdi32.DeleteDC(hdc); _user32.ReleaseDC(0, hdc_screen)
+        return arr
+
+    def cursor_layers(hcursor):
+        """(color_bgr, transparency) 32x32 float arrays for an hCursor (cached), or None.
+        Drawing the cursor on black and on white recovers true color + alpha:
+        transparency=(white-black)/255 (0=opaque,1=clear); color=black (premultiplied)."""
+        if not hcursor:
+            return None
+        key = int(hcursor)
+        if key in _cursor_cache:
+            return _cursor_cache[key]
+        result = None
+        try:
+            black = _draw_cursor_on(hcursor, 0)
+            white = _draw_cursor_on(hcursor, 255)
+            transp = np.clip((white - black) / 255.0, 0.0, 1.0)
+            result = (black, transp)
+        except Exception:
+            result = None
+        if len(_cursor_cache) > 32:
+            _cursor_cache.clear()
+        _cursor_cache[key] = result
+        return result
 else:
     def _move_relative(dx, dy):
         pass  # patched to pynput's relative move per-controller on non-Windows
 
     def cursor_screen_pos():
+        return None
+
+    def cursor_state():
+        return None, None, None
+
+    def cursor_layers(hcursor):
         return None
 
 # capture / quality
@@ -127,7 +218,7 @@ DEFAULT_FPS = 60                      # smooth 60 fps
 # number of pixels drawn. In "smooth" priority we cap the *drawn* width so the frame
 # rate stays high (~45 fps at 1440); the image is centered and a small side border may
 # show on a bigger window. "sharp" priority draws at full canvas size for max crispness.
-RENDER_MAX_W_SMOOTH = 1440
+RENDER_MAX_W_SMOOTH = 1280
 
 # palette  —  cyan-on-deep-navy "command console" (dark base + one neon accent)
 BG          = "#0A0E14"   # deepest window background
@@ -358,18 +449,50 @@ def monitor_geometry(monitor_index):
     return m["left"], m["top"], m["width"], m["height"]
 
 
-# A classic arrow cursor drawn into the frame (the capture APIs don't include it).
-_CURSOR_POLY = np.array([[0, 0], [0, 16], [4, 12], [7, 19], [10, 18], [6, 11], [11, 11]], np.int32)
+# Fallback arrow, used only if the real cursor can't be captured (the capture APIs
+# don't include the cursor). A classic arrow shape.
+_CURSOR_PX = 32                          # native cursor size (must match the capture size)
+_CURSOR_POLY = np.array([[0, 0], [0, 16], [4, 12], [7, 19], [10, 18], [6, 11], [11, 11]], np.float32)
 
 
-def _draw_cursor(img, x, y):
-    h, w = img.shape[:2]
-    if not (-12 <= x < w and -12 <= y < h):
+def _blit_cursor(img, x, y, color, transp):
+    """Alpha-composite a premultiplied cursor (color) with per-pixel transparency onto img.
+    out = color + background * transparency  (transparency: 0 = opaque, 1 = clear)."""
+    ih, iw = img.shape[:2]
+    ch, cw = color.shape[:2]
+    sx, sy = max(0, -x), max(0, -y)                 # crop offset when the cursor hangs off an edge
+    dx0, dy0 = max(0, x), max(0, y)
+    dx1, dy1 = min(iw, x + cw), min(ih, y + ch)
+    if dx1 <= dx0 or dy1 <= dy0:
         return
-    pts = _CURSOR_POLY + (int(x), int(y))
-    cv2.polylines(img, [pts], True, (0, 0, 0), 3, cv2.LINE_AA)     # dark halo
-    cv2.fillPoly(img, [pts], (255, 255, 255), cv2.LINE_AA)         # white body
-    cv2.polylines(img, [pts], True, (0, 0, 0), 1, cv2.LINE_AA)     # crisp edge
+    bw, bh = dx1 - dx0, dy1 - dy0
+    col = color[sy:sy + bh, sx:sx + bw]
+    tr = transp[sy:sy + bh, sx:sx + bw]
+    roi = img[dy0:dy1, dx0:dx1].astype(np.float32)
+    img[dy0:dy1, dx0:dx1] = np.clip(col + roi * tr, 0, 255).astype(np.uint8)
+
+
+def _draw_cursor(img, x, y, hcursor=None, scale=1.0):
+    """Draw the mouse cursor into the frame at (x, y) in FRAME pixels, sized to `scale`
+    so it stays the same apparent size no matter how the stream resolution adapts."""
+    x, y = int(round(x)), int(round(y))
+    size = max(8, int(round(_CURSOR_PX * scale)))
+    layers = cursor_layers(hcursor)
+    if layers is not None:
+        color, transp = layers                       # real 32x32 cursor (color + alpha)
+        interp = cv2.INTER_AREA if size < _CURSOR_PX else cv2.INTER_LINEAR
+        col = cv2.resize(color, (size, size), interpolation=interp)
+        tr = cv2.resize(transp, (size, size), interpolation=interp)
+        _blit_cursor(img, x, y, col, tr)
+        return
+    # Fallback: a size-stable synthetic arrow (scales with the stream, so no more grow/shrink).
+    h, w = img.shape[:2]
+    if not (-size <= x < w and -size <= y < h):
+        return
+    pts = (_CURSOR_POLY * scale + (x, y)).astype(np.int32)
+    cv2.polylines(img, [pts], True, (0, 0, 0), max(1, int(round(3 * scale))), cv2.LINE_AA)
+    cv2.fillPoly(img, [pts], (255, 255, 255), cv2.LINE_AA)
+    cv2.polylines(img, [pts], True, (0, 0, 0), 1, cv2.LINE_AA)
 
 
 class ScreenGrabber:
@@ -429,13 +552,14 @@ class ScreenGrabber:
             # INTER_LINEAR is much faster than INTER_AREA for downscaling and looks
             # nearly identical on live video — more fps / less delay.
             bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
-        # Draw the OS cursor into the frame when it's visible (menus, chests, desktop)
+        # Draw the REAL OS cursor into the frame when it's visible (menus, chests, desktop)
         # so the controller can see and click it. Hidden during game-play automatically.
-        cur = cursor_screen_pos()
-        if cur is not None:
+        # Sized by `scale` so it stays a constant apparent size as the stream resolution adapts.
+        cx, cy, hcur = cursor_state()
+        if cx is not None:
             if scale == 1.0:
                 bgr = bgr.copy()                  # don't scribble on the capture buffer
-            _draw_cursor(bgr, (cur[0] - self.left) * scale, (cur[1] - self.top) * scale)
+            _draw_cursor(bgr, (cx - self.left) * scale, (cy - self.top) * scale, hcur, scale)
         params = [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
         if hasattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR"):
             h, w = bgr.shape[:2]
